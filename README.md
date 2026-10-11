@@ -25,19 +25,34 @@ never restored.
   attachment compatibility at runtime; enhancement does not exclude newer APIs
   solely by their Android version.
 
-Runtime verification so far used x86_64 AVDs. Other ABI builds are available
-without an artificial runtime block; device compatibility feedback is welcome.
+Runtime verification includes x86_64 AVDs and an ARM64 Android 16 device with
+SELinux enforcing. Other ABI builds remain available without an artificial
+runtime block; device compatibility feedback is welcome.
 
-Activation requires DNS route readiness. Caches belong to individual networks
+Activation requires a valid prepared resolver configuration. Caches belong to individual networks
 and policy generations. Active Private DNS, DNS64/NAT64, or unknown resolver
 configuration prevents activation when a safe clone cannot be made.
 
-On API 26–28, network discovery omits caches without DNS servers, while cache
+Network discovery omits caches without DNS servers, while cache
 reservation still treats those entries as occupied. A newly configured network
 changes the discovered inventory and requires a new policy generation. INFO
 reports module capabilities; it does not guarantee that the system has published
 DNS configuration. PREPARE fails when no configured DNS network is available.
 Resolver preparation failures are logged under the `AsteriskEnhance` logcat tag.
+
+## SELinux policy
+
+The module installs `sepolicy.rule` in standalone packages and application APKs.
+It grants `netd` only the additional `self:process execmem` permission required
+by Zygisk Next inline hooks. SELinux remains enforcing. Before installing hooks,
+the module checks executable memory access and leaves enhancement unavailable
+if this prerequisite fails, rather than risking a netd crash.
+
+The companion runs in the ROOT manager's domain. Zygisk Next supplies its
+private transport; the companion passes the resolver bridge as a file descriptor
+with the `system_lib_file` label. Resolver Binder access uses netd's existing
+platform permissions. No application-domain access, permissive domain, or
+wildcard SELinux grant is added by this module.
 
 ## Standalone build
 
@@ -59,7 +74,7 @@ creating a separate module ZIP.
 
 ## Application integration and installation
 
-The planned Git submodule checkout path is `enhance/src/main/native`. Local
+The Git submodule checkout path is `enhance/src/main/module`. Local
 application builds can use `-PenhanceSourceDir=<path>`. Each application's
 `enhance` Gradle module adds installer files and all four ABI payloads before
 APK signing. Payloads live under `assets/enhance/lib/<ABI>/` and are independent

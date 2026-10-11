@@ -13,6 +13,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/system_properties.h>
 #include <unistd.h>
@@ -260,6 +261,24 @@ void *background_runtime(void *) {
     }
 }
 
+bool hook_memory_available() {
+    const size_t size = static_cast<size_t>(getpagesize());
+    void *page = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (page == MAP_FAILED) {
+        __android_log_print(ANDROID_LOG_ERROR, kTag, "hook memory allocation failed: %d", errno);
+        return false;
+    }
+    const int result = mprotect(page, size, PROT_READ | PROT_EXEC);
+    const int error = errno;
+    munmap(page, size);
+    if (result)
+        __android_log_print(ANDROID_LOG_ERROR,
+                            kTag,
+                            "hook executable memory unavailable: %d; check module SELinux policy",
+                            error);
+    return result == 0;
+}
+
 void loaded(void *self, const ZygiskNextAPI *api) {
     runtime_api = *api;
     module_handle = self;
@@ -267,7 +286,8 @@ void loaded(void *self, const ZygiskNextAPI *api) {
     char level[PROP_VALUE_MAX]{};
     __system_property_get("ro.build.version.sdk", level);
     platform_api = std::atoi(level);
-    auto *symbols = api->newSymbolResolver("/system/bin/netd", nullptr);
+    const bool hook_memory = hook_memory_available();
+    auto *symbols = hook_memory ? api->newSymbolResolver("/system/bin/netd", nullptr) : nullptr;
     if (symbols) {
         void *target = api->symbolLookup(
             symbols,
@@ -329,7 +349,7 @@ void loaded(void *self, const ZygiskNextAPI *api) {
                 ANDROID_LOG_ERROR, kTag, "required NetworkController interface not found");
         }
         api->freeSymbolResolver(symbols);
-    } else {
+    } else if (hook_memory) {
         __android_log_print(ANDROID_LOG_ERROR, kTag, "netd symbols unavailable");
     }
     __android_log_print(ANDROID_LOG_INFO,

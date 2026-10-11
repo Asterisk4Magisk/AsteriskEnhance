@@ -23,7 +23,7 @@ enum AePhase {
     AE_STATE_DRAINING = 3
 };
 #define AE_MARK_MASK 0x61000000U
-#define AE_PROXY_MARK 0x01000000U
+#define AE_PROXY_MARK 0x21000000U
 #define AE_DIRECT_MARK 0x41000000U
 #define AE_MAX_DNS_ROUTES 64U
 struct AeDnsRoute {

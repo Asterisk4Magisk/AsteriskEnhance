@@ -1,0 +1,5 @@
+# Copyright 2026, Asterisk4Magisk contributors
+# SPDX-License-Identifier: GPL-3.0
+
+# Zygisk Next inline hooks allocate executable trampolines in netd.
+allow netd netd process execmem

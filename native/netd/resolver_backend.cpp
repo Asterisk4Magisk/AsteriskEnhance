@@ -415,8 +415,30 @@ int ae_backend_read(uint32_t network, AeDnsConfig *output) {
 int ae_backend_networks(uint32_t *output, uint32_t capacity) {
     if (!ready || !output || !capacity)
         return -ENOTSUP;
-    if (platform >= 29)
-        return ae_platform_list_caches(list29, output, capacity);
+    if (platform >= 29) {
+        const int available = ae_platform_list_caches(list29, output, capacity);
+        if (available < 0)
+            return available;
+        uint32_t count = 0;
+        for (int i = 0; i < available; ++i) {
+            AeDnsConfig config{};
+            const int error = read29(output[i], &config);
+            // Android also keeps caches for networks without configured DNS.
+            // Keep them reserved, but do not clone them into a policy generation.
+            if (error == -ENOENT)
+                continue;
+            if (error) {
+                __android_log_print(ANDROID_LOG_ERROR,
+                                    "AsteriskEnhance",
+                                    "cache discovery: read network=%u error=%d",
+                                    output[i],
+                                    error);
+                return error;
+            }
+            output[count++] = output[i];
+        }
+        return static_cast<int>(count);
+    }
     // The legacy public stats API is a native, mutex-protected lookup. Enumerate
     // the bounded real-network domain without reading private cache structures.
     uint32_t count = 0;
