@@ -91,13 +91,17 @@ void decorate_context(AeContext *context) {
     if (!context || !ae_query_in_command())
         return;
     if (ae_store_has_active(ae_store_global())) {
-        timespec now{};
-        if (!clock_gettime(CLOCK_BOOTTIME, &now)) {
-            const uint64_t milliseconds = static_cast<uint64_t>(now.tv_sec) * 1000U +
-                                          static_cast<uint64_t>(now.tv_nsec) / 1000000U;
-            ae_store_apply_observed(
-                ae_store_global(), netd_instance, milliseconds, context, ae_query_observe, nullptr);
+        // API27's experimental TLS validation has no completion callback.
+        // Check its local resolver state only on a real query, never on a timer.
+        if (platform_api == 27) {
+            AeDnsConfig config{};
+            if (ae_backend_read(context->dns_netid, &config)) {
+                ae_runtime_network_changed();
+                return;
+            }
         }
+        ae_store_apply_observed(
+            ae_store_global(), netd_instance, context, ae_query_observe, nullptr);
     }
 }
 
@@ -221,7 +225,7 @@ void *background_runtime(void *) {
             &runtime_api, platform_api < 29 ? "/system/bin/netd" : resolver_path, platform_api);
     bool initialized = false;
     for (;;) {
-        ae_runtime_tick();
+        ae_runtime_reap();
         const int companion = runtime_api.connectCompanion(module_handle);
         if (companion < 0) {
             sleep(1);

@@ -14,10 +14,10 @@ static void little_write(uint8_t *bytes, unsigned width, uint64_t value) {
         bytes[i] = (uint8_t)(value >> (8 * i));
 }
 static int header_valid(const struct AeWireHeader *header) {
-    if (!header || header->opcode < AE_HELLO || header->opcode > AE_INFO_REPLY ||
+    if (!header || header->opcode < AE_HELLO || header->opcode > AE_NETWORK_CHANGED ||
         header->body_length > AE_WIRE_MAX_BODY || !header->request_id)
         return 0;
-    if (header->opcode == AE_INFO &&
+    if ((header->opcode == AE_INFO || header->opcode == AE_NETWORK_CHANGED) &&
         (header->body_length || header->instance || header->cycle || header->generation))
         return 0;
     if (header->opcode == AE_INFO_REPLY &&
@@ -27,7 +27,7 @@ static int header_valid(const struct AeWireHeader *header) {
     if (header->opcode >= AE_PREPARE && header->opcode <= AE_RELEASE &&
         (!header->instance || !header->cycle || !header->generation))
         return 0;
-    if ((header->opcode == AE_ACTIVATE || header->opcode == AE_RENEW) && header->body_length != 8)
+    if ((header->opcode == AE_ACTIVATE || header->opcode == AE_CHECK) && header->body_length != 8)
         return 0;
     if ((header->opcode == AE_DEACTIVATE || header->opcode == AE_RELEASE ||
          header->opcode == AE_HELLO) &&

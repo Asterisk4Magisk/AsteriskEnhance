@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: GPL-3.0
 
 #include "actor.h"
-#include "lease.h"
 #include "store.h"
 
 struct AeActor {
@@ -10,7 +9,6 @@ struct AeActor {
     struct AeActorBackend backend;
     uint64_t netd_instance, connection;
     struct AeWireHeader key;
-    struct AeLease lease;
     uint32_t phase, auto_release, modes, seed, used_ids, owned_count, discovered;
     struct AePolicy policy;
     uint32_t uids[AE_MAX_UIDS], bypass[AE_MAX_UIDS];
@@ -36,7 +34,6 @@ int ae_actor_init(void *memory,
     actor->netd_instance = instance;
     actor->connection = 0;
     actor->key = (struct AeWireHeader){0};
-    actor->lease = (struct AeLease){0};
     actor->phase = AE_STATE_IDLE;
     actor->auto_release = 0;
     actor->modes = modes;
@@ -59,7 +56,6 @@ key_matches(const struct AeActor *actor, uint64_t connection, const struct AeWir
 }
 static void withdraw(struct AeActor *actor, int automatic) {
     ae_store_revoke(actor->store);
-    ae_lease_revoke(&actor->lease);
     actor->policy.active = 0;
     actor->phase = AE_STATE_DRAINING;
     if (automatic)
@@ -80,14 +76,21 @@ static enum AeResult release_resources(struct AeActor *actor) {
     actor->auto_release = 0;
     return AE_OK;
 }
-void ae_actor_tick(void *memory, uint64_t now) {
+void ae_actor_reap(void *memory) {
     if (!memory)
         return;
     struct AeActor *actor = memory;
-    if (actor->phase == AE_STATE_ACTIVE && !ae_lease_valid(&actor->lease, now))
-        withdraw(actor, 1);
     if (actor->phase == AE_STATE_DRAINING && actor->auto_release)
         release_resources(actor);
+}
+int ae_actor_poll_timeout(const void *memory) {
+    const struct AeActor *actor = memory;
+    if (!actor)
+        return -1;
+    // Retained resolver workers may finish without a control-channel event.
+    if (actor->phase == AE_STATE_DRAINING && actor->auto_release)
+        return 1000;
+    return -1;
 }
 void ae_actor_disconnect(void *memory, uint64_t connection) {
     if (!memory)
@@ -116,13 +119,12 @@ static int configurations_current(struct AeActor *actor) {
 enum AeResult ae_actor_prepare(void *memory,
                                uint64_t connection,
                                const struct AeWireHeader *key,
-                               const struct AePrepare *input,
-                               uint64_t now) {
+                               const struct AePrepare *input) {
     if (!memory || !key_valid(connection, key) || key->opcode != AE_PREPARE ||
         !ae_prepare_valid(input))
         return AE_INVALID;
     struct AeActor *actor = memory;
-    ae_actor_tick(actor, now);
+    ae_actor_reap(actor);
     if (input->netd_instance != actor->netd_instance)
         return AE_STALE;
     if (!(actor->modes & (1U << (input->run_mode - 1))) || input->mark_mask != AE_MARK_MASK ||
@@ -162,7 +164,6 @@ enum AeResult ae_actor_prepare(void *memory,
         actor->bypass[i] = input->bypass_uids[i];
     actor->policy = (struct AePolicy){actor->netd_instance,
                                       key->generation,
-                                      1,
                                       0,
                                       input->policy_mode,
                                       input->mark_mask,
@@ -253,7 +254,7 @@ enum AeResult ae_actor_control_until(void *memory,
         key->opcode > AE_RELEASE || key->body_length)
         return AE_INVALID;
     struct AeActor *actor = memory;
-    ae_actor_tick(actor, now);
+    ae_actor_reap(actor);
     if (now >= request_deadline)
         return AE_STALE;
     if (!key_matches(actor, connection, key))
@@ -277,29 +278,19 @@ enum AeResult ae_actor_control_until(void *memory,
         withdraw(actor, 1);
         return AE_CACHE_ERROR;
     }
-    // Platform configuration checks can block in Binder. A receive-time stamp
-    // must never revive a lease that expired while those checks were running.
+    // Configuration checks can block in Binder; honor the caller's request budget.
     now = actor->backend.now_ms(actor->backend.opaque);
     if (now >= request_deadline) {
         withdraw(actor, 1);
         return AE_STALE;
     }
-    struct AeLease lease = actor->lease;
-    int valid =
-        activating
-            ? ae_lease_activate(&lease, connection, key->instance, key->cycle, key->generation, now)
-            : ae_lease_renew(&lease, connection, key->instance, key->cycle, key->generation, now);
-    if (!valid) {
-        withdraw(actor, 1);
-        return AE_STALE;
-    }
+    if (!activating)
+        return AE_OK;
     struct AePolicy policy = actor->policy;
     policy.active = 1;
-    policy.deadline_ms = lease.deadline;
     if (!ae_store_publish(actor->store, &policy))
         return AE_BUSY;
     actor->policy = policy;
-    actor->lease = lease;
     actor->phase = AE_STATE_ACTIVE;
     return AE_OK;
 }

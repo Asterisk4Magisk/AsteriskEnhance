@@ -13,12 +13,10 @@ AE_EXPORT void ae_store_init(void *store);
 // Single background writer. A busy inactive slot returns 0; never blocks a
 // resolver thread. Arrays are copied before atomic publication.
 AE_EXPORT int ae_store_publish(void *store, const struct AePolicy *policy);
-AE_EXPORT enum AeDecision
-ae_store_apply(void *store, uint64_t instance, uint64_t now_ms, struct AeContext *context);
+AE_EXPORT enum AeDecision ae_store_apply(void *store, uint64_t instance, struct AeContext *context);
 typedef int (*AeSelectionObserver)(void *opaque, uint64_t generation, uint32_t cache_id);
 AE_EXPORT enum AeDecision ae_store_apply_observed(void *store,
                                                   uint64_t instance,
-                                                  uint64_t now_ms,
                                                   struct AeContext *context,
                                                   AeSelectionObserver observer,
                                                   void *opaque);

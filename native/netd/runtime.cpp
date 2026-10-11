@@ -5,7 +5,6 @@
 #include "resolver_backend.h"
 #include "../common/session.h"
 #include "../common/store.h"
-#include "../common/lease.h"
 #include "../broker/io.h"
 #include <cerrno>
 #include <cstdio>
@@ -13,8 +12,12 @@
 #include <cstdlib>
 #include <poll.h>
 #include <pthread.h>
+#include <atomic>
+#include <sys/eventfd.h>
+#include <unistd.h>
 namespace {
 pthread_mutex_t writer = PTHREAD_MUTEX_INITIALIZER;
+std::atomic<int> network_event{-1};
 void *actor = nullptr;
 void *session = nullptr;
 std::vector<uint8_t> runtime_info;
@@ -29,6 +32,9 @@ bool ae_runtime_init(uint64_t instance, uint32_t api, uint32_t modes, uint32_t f
     AeRuntimeGuard guard;
     if (session)
         return true;
+    const int event = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (event < 0)
+        return false;
     actor = std::calloc(1, ae_actor_size());
     session = std::calloc(1, ae_session_size());
     const auto backend = ae_backend_callbacks();
@@ -37,6 +43,7 @@ bool ae_runtime_init(uint64_t instance, uint32_t api, uint32_t modes, uint32_t f
         !ae_session_init(session, actor, instance, api, modes, flags)) {
         std::free(actor);
         std::free(session);
+        close(event);
         actor = nullptr;
         session = nullptr;
         return false;
@@ -46,7 +53,7 @@ bool ae_runtime_init(uint64_t instance, uint32_t api, uint32_t modes, uint32_t f
                                      sizeof(text),
                                      "AE_INFO "
                                      "1\nversionCode=%s\nversion=%s\nbuildId=%s\nnetd=%llu\napi=%"
-                                     "u\nmodes=%u\nflags=%u\nprotocol=4\n",
+                                     "u\nmodes=%u\nflags=%u\nprotocol=5\n",
                                      AE_MODULE_VERSION_CODE,
                                      AE_MODULE_VERSION,
                                      AE_MODULE_BUILD_ID,
@@ -57,12 +64,24 @@ bool ae_runtime_init(uint64_t instance, uint32_t api, uint32_t modes, uint32_t f
     if (length <= 0 || static_cast<size_t>(length) >= sizeof(text))
         return false;
     runtime_info.assign(text, text + length);
+    network_event.store(event);
     return true;
 }
-void ae_runtime_tick() {
+void ae_runtime_network_changed() {
+    // Called by resolver hooks. Never take the writer lock or call Binder here.
+    const int event = network_event.load();
+    if (event >= 0) {
+        const uint64_t one = 1;
+        ssize_t result;
+        do {
+            result = write(event, &one, sizeof(one));
+        } while (result < 0 && errno == EINTR);
+    }
+}
+void ae_runtime_reap() {
     AeRuntimeGuard guard;
     if (actor)
-        ae_actor_tick(actor, ae_now_ms());
+        ae_actor_reap(actor);
 }
 void ae_runtime_serve(int channel) {
     if (!session)
@@ -73,14 +92,35 @@ void ae_runtime_serve(int channel) {
         return;
     uint64_t current = 0;
     for (;;) {
-        ae_runtime_tick();
-        pollfd event{channel, POLLIN, 0};
-        const int ready = poll(&event, 1, 100);
+        ae_runtime_reap();
+        pollfd events[] = {{channel, POLLIN, 0}, {network_event.load(), POLLIN, 0}};
+        int timeout;
+        {
+            AeRuntimeGuard guard;
+            timeout = ae_actor_poll_timeout(actor);
+        }
+        const int ready = poll(events, 2, timeout);
         if (ready < 0 && errno == EINTR)
             continue;
         if (ready < 0)
             break;
         if (!ready)
+            continue;
+        if (events[1].revents & POLLIN) {
+            uint64_t changes;
+            ssize_t result;
+            do {
+                result = read(events[1].fd, &changes, sizeof(changes));
+            } while (result < 0 && errno == EINTR);
+            if (current) {
+                AeWireHeader changed{AE_NETWORK_CHANGED, 0, 1, 0, 0, 0};
+                std::vector<uint8_t> empty;
+                if (!ae_write_frame(
+                        channel, changed, empty, ae_now_ms() + AE_CONTROL_TIMEOUT_MILLISECONDS))
+                    break;
+            }
+        }
+        if (!events[0].revents)
             continue;
         uint64_t deadline = ae_now_ms() + AE_CONTROL_TIMEOUT_MILLISECONDS;
         uint64_t connection = 0;
@@ -123,5 +163,5 @@ void ae_runtime_serve(int channel) {
     }
     AeRuntimeGuard guard;
     ae_session_close(session);
-    ae_actor_tick(actor, ae_now_ms());
+    ae_actor_reap(actor);
 }

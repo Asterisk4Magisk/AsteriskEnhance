@@ -61,7 +61,6 @@ int ae_store_publish(void *memory, const struct AePolicy *policy) {
 }
 enum AeDecision ae_store_apply_observed(void *memory,
                                         uint64_t instance,
-                                        uint64_t now,
                                         struct AeContext *context,
                                         AeSelectionObserver observer,
                                         void *opaque) {
@@ -79,8 +78,7 @@ enum AeDecision ae_store_apply_observed(void *memory,
         }
         const uint32_t original_netid = context ? context->dns_netid : 0;
         const uint32_t original_mark = context ? context->dns_mark : 0;
-        enum AeDecision result =
-            ae_policy_apply(&store->slots[slot].policy, instance, now, context);
+        enum AeDecision result = ae_policy_apply(&store->slots[slot].policy, instance, context);
         if (result == AE_PROXY && observer &&
             !observer(opaque, store->slots[slot].policy.generation, context->dns_netid)) {
             context->dns_netid = original_netid;
@@ -92,9 +90,8 @@ enum AeDecision ae_store_apply_observed(void *memory,
     }
     return AE_ORIGINAL;
 }
-enum AeDecision
-ae_store_apply(void *memory, uint64_t instance, uint64_t now, struct AeContext *context) {
-    return ae_store_apply_observed(memory, instance, now, context, 0, 0);
+enum AeDecision ae_store_apply(void *memory, uint64_t instance, struct AeContext *context) {
+    return ae_store_apply_observed(memory, instance, context, 0, 0);
 }
 int ae_store_quiescent(void *memory) {
     if (!memory)

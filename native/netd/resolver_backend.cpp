@@ -3,6 +3,7 @@
 
 #include "resolver_backend.h"
 #include "query_lifetime.h"
+#include "runtime.h"
 #include <arpa/inet.h>
 #include <android/log.h>
 #include <cerrno>
@@ -71,8 +72,11 @@ int configure_guard26(unsigned id,
                       unsigned count,
                       const char *domains,
                       const Params26 *params) {
-    if (!candidate(id))
-        return original_configure26(id, servers, count, domains, params);
+    if (!candidate(id)) {
+        const int result = original_configure26(id, servers, count, domains, params);
+        ae_runtime_network_changed();
+        return result;
+    }
     pthread_mutex_lock(&gate);
     const int result = find(id) ? EBUSY : original_configure26(id, servers, count, domains, params);
     pthread_mutex_unlock(&gate);
@@ -81,12 +85,47 @@ int configure_guard26(unsigned id,
 void delete_guard26(unsigned id) {
     if (!candidate(id)) {
         original_delete26(id);
+        ae_runtime_network_changed();
         return;
     }
     pthread_mutex_lock(&gate);
     if (!find(id))
         original_delete26(id);
     pthread_mutex_unlock(&gate);
+}
+using ResolverConfigure = int (*)(void *, const void *);
+using ResolverConfigure29 = int (*)(void *, const void *, const void *);
+ResolverConfigure original_resolver_configure = nullptr;
+ResolverConfigure29 original_resolver_configure29 = nullptr;
+Delete26 original_resolver_delete = nullptr;
+using PrefixReport = bool (*)(void *, unsigned, bool, const void *);
+using PrefixSet = int (*)(void *, unsigned, const void *);
+PrefixReport original_prefix_report = nullptr;
+PrefixSet original_prefix_set = nullptr;
+bool prefix_reported(void *controller, unsigned network, bool added, const void *prefix) {
+    const bool result = original_prefix_report(controller, network, added, prefix);
+    ae_runtime_network_changed();
+    return result;
+}
+int prefix_set(void *controller, unsigned network, const void *prefix) {
+    const int result = original_prefix_set(controller, network, prefix);
+    ae_runtime_network_changed();
+    return result;
+}
+int configure_changed(void *controller, const void *params) {
+    const int result = original_resolver_configure(controller, params);
+    ae_runtime_network_changed();
+    return result;
+}
+int configure_changed29(void *controller, const void *params, const void *fingerprints) {
+    const int result = original_resolver_configure29(controller, params, fingerprints);
+    ae_runtime_network_changed();
+    return result;
+}
+void delete_changed(unsigned id) {
+    original_resolver_delete(id);
+    if (!candidate(id))
+        ae_runtime_network_changed();
 }
 int legacy_info(uint32_t id, AeDnsConfig *output) {
     int count = 0, domain_count = 0;
@@ -331,7 +370,7 @@ int routes(void *, uint32_t network, uint32_t id, AeDnsRoute *output, uint32_t c
 }
 uint64_t now_ms(void *) {
     timespec now{};
-    if (clock_gettime(CLOCK_BOOTTIME, &now))
+    if (clock_gettime(CLOCK_MONOTONIC, &now))
         return UINT64_MAX;
     return static_cast<uint64_t>(now.tv_sec) * 1000U +
            static_cast<uint64_t>(now.tv_nsec) / 1000000U;
@@ -389,7 +428,59 @@ bool ae_backend_init(const ZygiskNextAPI *api, int sdk, void *bridge, const char
         if (!resolver)
             return false;
         list29 = api->symbolLookup(resolver, "_Z18resolv_list_cachesv", false, nullptr);
+        const char *configure_symbol =
+            sdk == 29 ? "_ZN7android3net18ResolverController24setResolverConfigurationERKN4aidl7and"
+                        "roid3net20ResolverParamsParcelERKNSt3__13setINS8_6vectorIhNS8_"
+                        "9allocatorIhEEEENS8_4lessISD_EENSB_ISD_EEEE"
+                      : "_ZN7android3net18ResolverController24setResolverConfigurationERKN4aidl7and"
+                        "roid3net20ResolverParamsParcelE";
+        void *configure = api->symbolLookup(resolver, configure_symbol, false, nullptr);
+        void *remove =
+            api->symbolLookup(resolver, "_Z27resolv_delete_cache_for_netj", false, nullptr);
+        void *report_prefix = api->symbolLookup(resolver,
+                                                "_ZN7android3net18Dns64Configuration23reportNat64Pr"
+                                                "efixStatusEjbRKNS_9netdutils8IPPrefixE",
+                                                false,
+                                                nullptr);
+        void *set_prefix =
+            sdk >= 30
+                ? api->symbolLookup(
+                      resolver,
+                      "_ZN7android3net18Dns64Configuration11setPrefix64EjRKNS_9netdutils8IPPrefixE",
+                      false,
+                      nullptr)
+                : nullptr;
         api->freeSymbolResolver(resolver);
+        if (!configure || !remove || !report_prefix || (sdk >= 30 && !set_prefix))
+            return false;
+        void *replacement = sdk == 29 ? reinterpret_cast<void *>(configure_changed29)
+                                      : reinterpret_cast<void *>(configure_changed);
+        void **original = sdk == 29 ? reinterpret_cast<void **>(&original_resolver_configure29)
+                                    : reinterpret_cast<void **>(&original_resolver_configure);
+        struct Hook {
+            void *target, *replacement;
+            void **original;
+        } hooks[] = {{configure, replacement, original},
+                     {remove,
+                      reinterpret_cast<void *>(delete_changed),
+                      reinterpret_cast<void **>(&original_resolver_delete)},
+                     {report_prefix,
+                      reinterpret_cast<void *>(prefix_reported),
+                      reinterpret_cast<void **>(&original_prefix_report)},
+                     {set_prefix,
+                      reinterpret_cast<void *>(prefix_set),
+                      reinterpret_cast<void **>(&original_prefix_set)}};
+        const unsigned count = sdk >= 30 ? 4 : 3;
+        for (unsigned i = 0; i < count; ++i) {
+            if (api->inlineHook(hooks[i].target, hooks[i].replacement, hooks[i].original) !=
+                ZN_SUCCESS) {
+                while (i) {
+                    --i;
+                    api->inlineUnhook(hooks[i].target);
+                }
+                return false;
+            }
+        }
         read29 = reinterpret_cast<Read29>(dlsym(bridge, "ae_resolver_read_config"));
         reserve29 = reinterpret_cast<Cache29>(dlsym(bridge, "ae_resolver_reserve"));
         configure29 = reinterpret_cast<Configure29>(dlsym(bridge, "ae_resolver_configure"));

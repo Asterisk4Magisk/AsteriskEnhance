@@ -5,6 +5,7 @@
 #include "policy.h"
 #include <stddef.h>
 
+#define AE_CONTROL_TIMEOUT_MILLISECONDS 2000U
 #define AE_WIRE_MAGIC 0x314e4541U
 #define AE_WIRE_VERSION 1U
 #define AE_WIRE_HEADER_SIZE 40U
@@ -13,14 +14,15 @@ enum AeOpcode {
     AE_HELLO = 1,
     AE_PREPARE = 2,
     AE_ACTIVATE = 3,
-    AE_RENEW = 4,
+    AE_CHECK = 4,
     AE_DEACTIVATE = 5,
     AE_RELEASE = 6,
     AE_ACK = 7,
     AE_ERROR = 8,
     AE_CAPABILITIES = 9,
     AE_INFO = 10,
-    AE_INFO_REPLY = 11
+    AE_INFO_REPLY = 11,
+    AE_NETWORK_CHANGED = 12
 };
 struct AeWireHeader {
     uint16_t opcode;

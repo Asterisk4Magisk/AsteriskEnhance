@@ -4,7 +4,6 @@
 #include "server.h"
 #include "peer_auth.h"
 #include "io.h"
-#include "../common/lease.h"
 #include <cerrno>
 #include <cstdlib>
 #include <array>
@@ -57,11 +56,31 @@ void ae_broker_serve(int channel) {
             events[2] = {client, POLLIN, 0};
             for (size_t i = 0; i < pending.size(); ++i)
                 events[3 + i] = {pending[i].fd, POLLIN, 0};
-            const int count = poll(events.data(), events.size(), hello_pending ? 0 : 50);
+            int timeout = hello_pending ? 0 : -1;
+            const uint64_t now = ae_now_ms();
+            for (const auto &slot : pending) {
+                if (slot.fd < 0)
+                    continue;
+                const int remaining =
+                    slot.deadline > now ? static_cast<int>(slot.deadline - now) : 0;
+                if (timeout < 0 || remaining < timeout)
+                    timeout = remaining;
+            }
+            const int count = poll(events.data(), events.size(), timeout);
             if (count < 0 && errno == EINTR)
                 continue;
-            if (count < 0 || events[0].revents)
-                break; // Unsolicited response / dead netd.
+            if (count < 0)
+                break;
+            if (events[0].revents) {
+                AeWireHeader notification{};
+                std::vector<uint8_t> payload;
+                const uint64_t deadline = ae_now_ms() + AE_CONTROL_TIMEOUT_MILLISECONDS;
+                if (!ae_read_frame(channel, &notification, &payload, deadline) ||
+                    notification.opcode != AE_NETWORK_CHANGED)
+                    break;
+                if (client >= 0 && !ae_write_frame(client, notification, payload, deadline))
+                    break;
+            }
             if (events[1].revents & POLLIN) {
                 const int incoming =
                     accept4(listener, nullptr, nullptr, SOCK_CLOEXEC | SOCK_NONBLOCK);
@@ -104,7 +123,8 @@ void ae_broker_serve(int channel) {
                         if (ae_wire_decode(slot.header, sizeof(slot.header), &first) &&
                             ae_authorize_root(slot.fd)) {
                             if (first.opcode == AE_INFO) {
-                                // One tiny nonblocking write: a slow reader never stalls renewals.
+                                // One tiny nonblocking write: a slow reader never stalls control
+                                // requests.
                                 uint8_t reply[AE_WIRE_HEADER_SIZE + 512];
                                 AeWireHeader header{AE_INFO_REPLY,
                                                     static_cast<uint32_t>(information.size()),
@@ -158,9 +178,14 @@ void ae_broker_serve(int channel) {
                          ae_authorize_control_owner(client);
             if (valid) {
                 valid = ae_envelope(channel, &connection, &disconnect, true, &deadline) &&
-                        ae_write_frame(channel, request, body, deadline) &&
-                        ae_read_frame(channel, &reply, &response, deadline) &&
-                        reply.request_id == request.request_id &&
+                        ae_write_frame(channel, request, body, deadline);
+                while (valid) {
+                    valid = ae_read_frame(channel, &reply, &response, deadline);
+                    if (!valid || reply.opcode != AE_NETWORK_CHANGED)
+                        break;
+                    valid = ae_write_frame(client, reply, response, deadline);
+                }
+                valid = valid && reply.request_id == request.request_id &&
                         reply.instance == request.instance && reply.cycle == request.cycle &&
                         reply.generation == request.generation &&
                         (reply.opcode == AE_ACK || reply.opcode == AE_ERROR ||

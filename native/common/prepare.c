@@ -31,7 +31,6 @@ int ae_prepare_valid(const struct AePrepare *input) {
     }
     const struct AePolicy policy = {1,
                                     1,
-                                    1,
                                     0,
                                     input->policy_mode,
                                     input->mark_mask,

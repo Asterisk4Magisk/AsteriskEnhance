@@ -25,7 +25,7 @@ enum AeDecision {
     AE_MARK_CONFLICT = 4
 };
 struct AePolicy {
-    uint64_t instance_id, generation, deadline_ms;
+    uint64_t instance_id, generation;
     uint32_t active, mode, mark_mask, proxy_mark, direct_mark;
     uint32_t uid_count;
     const uint32_t *uids;
@@ -41,10 +41,8 @@ extern "C" {
 AE_EXPORT int ae_policy_valid(const struct AePolicy *policy);
 // Caller publishes only validated immutable policies and owns their lifetime.
 // Application does no allocation, file access, IPC or complete-list scan.
-AE_EXPORT enum AeDecision ae_policy_apply(const struct AePolicy *policy,
-                                          uint64_t instance_id,
-                                          uint64_t now_ms,
-                                          struct AeContext *context);
+AE_EXPORT enum AeDecision
+ae_policy_apply(const struct AePolicy *policy, uint64_t instance_id, struct AeContext *context);
 #ifdef __cplusplus
 }
 #endif

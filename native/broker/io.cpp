@@ -12,7 +12,7 @@
 #include <unistd.h>
 uint64_t ae_now_ms() {
     timespec now{};
-    if (clock_gettime(CLOCK_BOOTTIME, &now))
+    if (clock_gettime(CLOCK_MONOTONIC, &now))
         return UINT64_MAX;
     return static_cast<uint64_t>(now.tv_sec) * 1000U +
            static_cast<uint64_t>(now.tv_nsec) / 1000000U;

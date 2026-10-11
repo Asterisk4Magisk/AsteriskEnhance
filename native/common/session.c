@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: GPL-3.0
 
 #include "session.h"
-#include "lease.h"
 struct AeSession {
     void *actor;
     uint64_t netd_instance, connection, owner;
@@ -71,7 +70,7 @@ size_t ae_session_handle_until(void *memory,
     if (!ae_wire_encode(key, scratch, sizeof(scratch)) || key->body_length != length ||
         !session->connection)
         return 0;
-    if (key->opcode == AE_ACTIVATE || key->opcode == AE_RENEW) {
+    if (key->opcode == AE_ACTIVATE || key->opcode == AE_CHECK) {
         const uint8_t *bytes = body;
         uint64_t caller_deadline = 0;
         for (unsigned i = 0; i < 8; ++i)
@@ -101,7 +100,7 @@ size_t ae_session_handle_until(void *memory,
             else if (prepared.consumer_version != AE_CONSUMER_VERSION)
                 result = AE_UNSUPPORTED;
             else {
-                result = ae_actor_prepare(session->actor, session->connection, key, &prepared, now);
+                result = ae_actor_prepare(session->actor, session->connection, key, &prepared);
                 if (result == AE_OK && prepared.consumer_version == 2U)
                     route_count = ae_actor_routes(session->actor, routes, AE_MAX_DNS_ROUTES);
             }
@@ -123,15 +122,15 @@ size_t ae_session_handle_until(void *memory,
     uint8_t *bytes = (uint8_t *)output + AE_WIRE_HEADER_SIZE;
     put(bytes, session->netd_instance, 8);
     if (capabilities) {
-        const uint32_t values[] = {4,
+        const uint32_t values[] = {5,
                                    session->api,
                                    session->modes,
                                    AE_MARK_MASK,
                                    AE_PROXY_MARK,
                                    AE_DIRECT_MARK,
                                    AE_CONSUMER_VERSION,
-                                   AE_LEASE_MILLISECONDS,
-                                   AE_RENEW_MILLISECONDS,
+                                   0,
+                                   0,
                                    session->flags};
         for (unsigned i = 0; i < 10; ++i)
             put(bytes + 8 + i * 4, values[i], 4);

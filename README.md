@@ -95,7 +95,7 @@ the applications never reboot automatically.
 `@asterisk.enhance.dns` provides control requests and a read-only INFO query.
 Control requests require the root process owning the current
 `@asteriskd.control` listener. INFO does not establish a control session or
-change DNS policy, caches, or leases.
+change DNS policy or caches.
 
 Applications offer an update only when the running `versionCode` is lower than
 the version bundled in their APK. `version` and `buildId` are diagnostic fields.
@@ -104,6 +104,12 @@ Detection and update decisions do not inspect module directories on disk.
 
 See [control-protocol.md](docs/control-protocol.md) for framing, cache ownership,
 and lifecycle requirements.
+
+Idle control workers wait for events. Policies last until explicit withdrawal or
+control-connection loss, with no heartbeat or periodic renewal. Resolver changes
+trigger configuration checks and fresh cache generations when needed. A stalled
+supervisor with an open connection retains its last policy. Capability revision 5
+requires matching application support.
 
 ## License
 

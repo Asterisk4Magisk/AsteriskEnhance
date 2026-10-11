@@ -19,11 +19,11 @@ static int sorted_uids(const uint32_t *uids, uint32_t count) {
 }
 
 int ae_policy_valid(const struct AePolicy *policy) {
-    if (!policy || !policy->instance_id || !policy->generation || !policy->deadline_ms ||
-        policy->active > 1 || policy->mode < AE_WHITELIST || policy->mode > AE_GLOBAL ||
-        !policy->mark_mask || (policy->mark_mask & AE_SYSTEM_MARK_MASK) || !policy->proxy_mark ||
-        !policy->direct_mark || policy->proxy_mark == policy->direct_mark ||
-        (policy->proxy_mark & ~policy->mark_mask) || (policy->direct_mark & ~policy->mark_mask) ||
+    if (!policy || !policy->instance_id || !policy->generation || policy->active > 1 ||
+        policy->mode < AE_WHITELIST || policy->mode > AE_GLOBAL || !policy->mark_mask ||
+        (policy->mark_mask & AE_SYSTEM_MARK_MASK) || !policy->proxy_mark || !policy->direct_mark ||
+        policy->proxy_mark == policy->direct_mark || (policy->proxy_mark & ~policy->mark_mask) ||
+        (policy->direct_mark & ~policy->mark_mask) ||
         !sorted_uids(policy->uids, policy->uid_count) ||
         !sorted_uids(policy->bypass_uids, policy->bypass_count) || !policy->cache_count ||
         policy->cache_count > AE_MAX_NETWORKS || !policy->caches)
@@ -53,12 +53,10 @@ static int contains(const uint32_t *values, uint32_t count, uint32_t uid) {
     return first < count && values[first] == uid;
 }
 
-enum AeDecision ae_policy_apply(const struct AePolicy *policy,
-                                uint64_t instance_id,
-                                uint64_t now_ms,
-                                struct AeContext *context) {
+enum AeDecision
+ae_policy_apply(const struct AePolicy *policy, uint64_t instance_id, struct AeContext *context) {
     if (!policy || !context || !policy->active || policy->instance_id != instance_id ||
-        now_ms >= policy->deadline_ms || context->uid == UINT32_MAX)
+        context->uid == UINT32_MAX)
         return AE_ORIGINAL;
     if (context->dns_mark & policy->mark_mask)
         return AE_MARK_CONFLICT;

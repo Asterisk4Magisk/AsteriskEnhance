@@ -38,7 +38,7 @@ struct AeActorBackend {
     int (*check)(void *, uint32_t network_id, uint32_t cache_id);
     int (*destroy)(void *, uint32_t cache_id);
     uint32_t (*inflight)(void *);
-    uint64_t (*now_ms)(void *); // CLOCK_BOOTTIME; UINT64_MAX on clock failure.
+    uint64_t (*now_ms)(void *); // CLOCK_MONOTONIC; UINT64_MAX on clock failure.
     // Sorted original resolver networks; count on success, negative on error.
     // Optional for an explicit network list; required for discovery.
     int (*networks)(void *, uint32_t *, uint32_t capacity);
@@ -60,8 +60,7 @@ AE_EXPORT int ae_actor_init(void *,
 AE_EXPORT enum AeResult ae_actor_prepare(void *,
                                          uint64_t connection,
                                          const struct AeWireHeader *,
-                                         const struct AePrepare *,
-                                         uint64_t now_ms);
+                                         const struct AePrepare *);
 AE_EXPORT enum AeResult
 ae_actor_control(void *, uint64_t connection, const struct AeWireHeader *, uint64_t now_ms);
 AE_EXPORT enum AeResult ae_actor_control_until(void *,
@@ -70,7 +69,8 @@ AE_EXPORT enum AeResult ae_actor_control_until(void *,
                                                uint64_t now_ms,
                                                uint64_t request_deadline);
 AE_EXPORT void ae_actor_disconnect(void *, uint64_t connection);
-AE_EXPORT void ae_actor_tick(void *, uint64_t now_ms);
+AE_EXPORT void ae_actor_reap(void *);
+AE_EXPORT int ae_actor_poll_timeout(const void *);
 AE_EXPORT uint32_t ae_actor_phase(const void *);
 AE_EXPORT uint32_t ae_actor_resource_count(const void *);
 AE_EXPORT uint32_t ae_actor_routes(const void *, struct AeDnsRoute *, uint32_t capacity);
