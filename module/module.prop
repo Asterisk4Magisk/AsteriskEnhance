@@ -1,6 +1,6 @@
 id=zygisk-next-asterisk-enhance
 name=Asterisk Enhance
-version=v1.0.2
-versionCode=3
+version=v1.0.3
+versionCode=4
 author=Asterisk4Magisk
 description=System DNS Enhancement for Asterisk Apps. Requires Zygisk Next.

@@ -278,7 +278,7 @@ def main():
         for path in sorted((ROOT / "module").rglob("*")):
             if path.is_file():
                 entry = path.relative_to(ROOT / "module").as_posix()
-                if entry in ("customize.sh", "module.prop", "zn_modules.txt", "sepolicy.rule"):
+                if path.suffix == ".sh" or entry in ("module.prop", "zn_modules.txt", "sepolicy.rule"):
                     data = path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
                     package.writestr(entry, data)
                 else:

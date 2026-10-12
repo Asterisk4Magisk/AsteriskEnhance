@@ -40,6 +40,23 @@ reports module capabilities; it does not guarantee that the system has published
 DNS configuration. PREPARE fails when no configured DNS network is available.
 Resolver preparation failures are logged under the `AsteriskEnhance` logcat tag.
 
+## Missed netd injection recovery
+
+At boot, `service.sh` checks once whether netd started before the enabled Zygisk
+Next daemon. After boot completion it allows 30 seconds for normal initialization.
+Only when the same processes remain alive, their start times are readable, and
+neither the netd loaded marker nor the enhancement companion is present does it
+request `ctl.restart netd` once. It then waits up to 30 seconds for the new netd
+and companion, logging the outcome under `AsteriskEnhance` with `netd_recovery`.
+The restart can briefly interrupt network access.
+
+A process-lifetime abstract socket marks module loading before hook installation.
+Hook, capability, and DNS preparation failures therefore do not trigger this
+recovery. Missing/disabled Zygisk Next, unknown process state, a changed process,
+or a module already loaded also skips recovery. A `/dev` lock limits the entire
+check to once per boot; a failed restart is not retried. Recovery runs from the
+installed module independently of the applications and their VPN lifecycle.
+
 ## SELinux policy
 
 The module installs `sepolicy.rule` in standalone packages and application APKs.

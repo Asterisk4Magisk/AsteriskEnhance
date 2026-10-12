@@ -15,6 +15,7 @@
 #include <pthread.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/system_properties.h>
 #include <unistd.h>
 #include <time.h>
@@ -284,6 +285,21 @@ bool hook_memory_available() {
 }
 
 void loaded(void *self, const ZygiskNextAPI *api) {
+    // Keep a process-lifetime marker even when hooks/backend initialization fail.
+    // The boot recovery script must restart only missed injections.
+    sockaddr_un marker{};
+    marker.sun_family = AF_UNIX;
+    const int length = std::snprintf(marker.sun_path + 1,
+                                     sizeof(marker.sun_path) - 1,
+                                     "asterisk.enhance.netd.%d", getpid());
+    // Bind without listen: this is observable residency, not a control endpoint.
+    const int marker_fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (marker_fd < 0 || bind(marker_fd, reinterpret_cast<sockaddr *>(&marker),
+                            offsetof(sockaddr_un, sun_path) + 1 + length)) {
+        __android_log_print(ANDROID_LOG_ERROR, kTag, "loaded marker unavailable: errno=%d", errno);
+        if (marker_fd >= 0)
+            close(marker_fd);
+    }
     runtime_api = *api;
     module_handle = self;
     netd_instance = (static_cast<uint64_t>(getpid()) << 32) | arc4random();
