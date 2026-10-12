@@ -22,9 +22,19 @@ esac
 [ "$API" -ge 26 ] || abort "Android 8 or newer is required"
 [ -d /data/adb/modules/zygisksu ] || abort "Install Zygisk Next before AsteriskEnhance"
 mkdir -p "$MODPATH/lib"
-unzip -oj "$ZIPFILE" module.prop zn_modules.txt sepolicy.rule service.sh -d "$MODPATH" >&2
+unzip -oj "$ZIPFILE" module.prop zn_modules.txt sepolicy.rule post-fs-data.sh -d "$MODPATH" >&2
 [ -f "$MODPATH/sepolicy.rule" ] || abort "SELinux policy is missing"
-[ -f "$MODPATH/service.sh" ] || abort "Boot recovery script is missing"
+[ -f "$MODPATH/post-fs-data.sh" ] || abort "Early boot recovery script is missing"
+# KernelSU and APatch run post-mount after every module's post-fs-data script.
+BOOT_SCRIPT=post-fs-data.sh
+if [ "$KSU" = true ] || [ "$APATCH" = true ]; then
+    BOOT_SCRIPT=post-mount.sh
+fi
+# Keep one entry point and remove the previous late boot recovery on upgrades.
+rm -f "$MODPATH/service.sh" "$MODPATH/post-mount.sh"
+if [ "$BOOT_SCRIPT" = post-mount.sh ]; then
+    mv "$MODPATH/post-fs-data.sh" "$MODPATH/post-mount.sh"
+fi
 PAYLOAD=lib
 if unzip -l "$ZIPFILE" 2>/dev/null | grep -q "assets/enhance/lib/"; then
     PAYLOAD=assets/enhance/lib
@@ -38,5 +48,5 @@ unzip -oj "$ZIPFILE" \
 touch "$MODPATH/skip_mount"
 set_perm_recursive "$MODPATH" 0 0 0755 0644
 set_perm_recursive "$MODPATH/lib" 0 0 0755 0644 u:object_r:system_lib_file:s0
-set_perm "$MODPATH/service.sh" 0 0 0755
+set_perm "$MODPATH/$BOOT_SCRIPT" 0 0 0755
 
