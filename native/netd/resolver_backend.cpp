@@ -107,7 +107,8 @@ using ResolverConfigure = int (*)(void *, const void *);
 using ResolverConfigure29 = int (*)(void *, const void *, const void *);
 ResolverConfigure original_resolver_configure = nullptr;
 ResolverConfigure29 original_resolver_configure29 = nullptr;
-Delete26 original_resolver_delete = nullptr;
+using ResolverDelete = void (*)(void *, unsigned);
+ResolverDelete original_resolver_delete = nullptr;
 using PrefixReport = bool (*)(void *, unsigned, bool, const void *);
 using PrefixSet = int (*)(void *, unsigned, const void *);
 PrefixReport original_prefix_report = nullptr;
@@ -132,8 +133,8 @@ int configure_changed29(void *controller, const void *params, const void *finger
     ae_runtime_network_changed();
     return result;
 }
-void delete_changed(unsigned id) {
-    original_resolver_delete(id);
+void delete_changed(void *controller, unsigned id) {
+    original_resolver_delete(controller, id);
     if (!candidate(id))
         ae_runtime_network_changed();
 }
@@ -482,8 +483,14 @@ bool ae_backend_init(const ZygiskNextAPI *api, int sdk, void *bridge, const char
                       : "_ZN7android3net18ResolverController24setResolverConfigurationERKN4aidl7and"
                         "roid3net20ResolverParamsParcelE";
         void *configure = api->symbolLookup(resolver, configure_symbol, false, nullptr);
-        void *remove =
-            api->symbolLookup(resolver, "_Z27resolv_delete_cache_for_netj", false, nullptr);
+        // Hook the controller entry point, as for configuration changes. On x86_64,
+        // the low-level cache function can start with an FS-relative stack-canary
+        // load that the inline hook provider truncates while building its trampoline.
+        void *remove = api->symbolLookup(
+            resolver,
+            "_ZN7android3net18ResolverController19destroyNetworkCacheEj",
+            false,
+            nullptr);
         void *report_prefix = api->symbolLookup(resolver,
                                                 "_ZN7android3net18Dns64Configuration23reportNat64Pr"
                                                 "efixStatusEjbRKNS_9netdutils8IPPrefixE",
