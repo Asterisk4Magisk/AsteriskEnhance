@@ -53,7 +53,7 @@ bool ae_runtime_init(uint64_t instance, uint32_t api, uint32_t modes, uint32_t f
                                      sizeof(text),
                                      "AE_INFO "
                                      "1\nversionCode=%s\nversion=%s\nbuildId=%s\nnetd=%llu\napi=%"
-                                     "u\nmodes=%u\nflags=%u\nprotocol=5\n",
+                                     "u\nmodes=%u\nflags=%u\nprotocol=7\n",
                                      AE_MODULE_VERSION_CODE,
                                      AE_MODULE_VERSION,
                                      AE_MODULE_BUILD_ID,

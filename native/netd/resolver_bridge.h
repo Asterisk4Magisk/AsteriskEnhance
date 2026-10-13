@@ -16,7 +16,7 @@ struct AeDnsConfig {
 #ifdef __cplusplus
 extern "C" {
 #endif
-int ae_resolver_read_config(uint32_t network_id, struct AeDnsConfig *output);
+int ae_resolver_read_config_detail(uint32_t network_id, struct AeDnsConfig *output, uint32_t *reason);
 int ae_resolver_reserve(uint32_t cache_id);
 int ae_resolver_configure(uint32_t cache_id, const struct AeDnsConfig *config);
 int ae_resolver_destroy(uint32_t cache_id);

@@ -92,17 +92,20 @@ void decorate_context(AeContext *context) {
     if (!context || !ae_query_in_command())
         return;
     if (ae_store_has_active(ae_store_global())) {
+        bool unavailable = false;
         // API27's experimental TLS validation has no completion callback.
         // Check its local resolver state only on a real query, never on a timer.
         if (platform_api == 27) {
             AeDnsConfig config{};
             if (ae_backend_read(context->dns_netid, &config)) {
                 ae_runtime_network_changed();
-                return;
+                unavailable = true;
             }
         }
-        ae_store_apply_observed(
+        const auto decision = ae_store_apply_observed(
             ae_store_global(), netd_instance, context, ae_query_observe, nullptr);
+        if (unavailable && decision == AE_PROXY)
+            context->dns_netid = 0x7fffffffU;
     }
 }
 

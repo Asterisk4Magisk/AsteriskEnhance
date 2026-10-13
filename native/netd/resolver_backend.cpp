@@ -18,6 +18,7 @@
 extern "C" int ae_platform_list_caches(void *, uint32_t *, uint32_t);
 extern "C" int ae_platform_private_dns28(void *, uint32_t);
 extern "C" int ae_platform_private_dns27(void *, uint32_t, const sockaddr_storage *, uint32_t);
+static int discover(uint32_t *, uint32_t, const AeCacheBinding *, uint32_t);
 
 namespace {
 struct Params26 {
@@ -38,7 +39,7 @@ using Stats =
     int (*)(unsigned, int *, sockaddr_storage *, int *, char (*)[256], Params26 *, Stats26 *);
 using Configure26 = int (*)(unsigned, const char **, unsigned, const char *, const Params26 *);
 using Delete26 = void (*)(unsigned);
-using Read29 = int (*)(uint32_t, AeDnsConfig *);
+using Read29 = int (*)(uint32_t, AeDnsConfig *, uint32_t *);
 using Configure29 = int (*)(uint32_t, const AeDnsConfig *);
 using Cache29 = int (*)(uint32_t);
 Stats stats26 = nullptr;
@@ -52,6 +53,15 @@ void *private_dns28 = nullptr;
 void *private_dns27 = nullptr;
 int platform = 0;
 bool ready = false;
+thread_local AeFailure last_failure{};
+int failure(uint32_t stage, uint32_t reason, int error, uint32_t network) {
+    last_failure = {stage, reason, error, network};
+    __android_log_print(ANDROID_LOG_ERROR, "AsteriskEnhance",
+                        "DNS prepare failure: stage=%u reason=%u error=%d network=%u",
+                        stage, reason, error, network);
+    return error;
+}
+AeFailure failure_detail(void *) { return last_failure; }
 pthread_mutex_t gate = PTHREAD_MUTEX_INITIALIZER;
 struct Record {
     uint32_t id = 0, network = 0;
@@ -209,6 +219,7 @@ int legacy_configure(uint32_t id, const AeDnsConfig &config) {
     return result > 0 ? -result : result;
 }
 int create(void *, uint32_t network, uint32_t id, uint32_t *owned) {
+    last_failure = {};
     if (!owned)
         return 2;
     *owned = 0;
@@ -237,6 +248,7 @@ int create(void *, uint32_t network, uint32_t id, uint32_t *owned) {
         }
     if (!slot) {
         pthread_mutex_unlock(&gate);
+        failure(AE_FAIL_RESERVE, AE_REASON_CAPACITY, -ENOSPC, network);
         return 2;
     }
     if (platform < 29) {
@@ -262,11 +274,15 @@ int create(void *, uint32_t network, uint32_t id, uint32_t *owned) {
                                 id,
                                 error,
                                 *owned);
+        if (error || !*owned)
+            failure(AE_FAIL_CONFIGURE, AE_REASON_BACKEND, error ? error : -EIO, network);
         return !error && *owned ? 0 : 2;
     }
     const int reserved = reserve29(id);
     if (reserved) {
         pthread_mutex_unlock(&gate);
+        if (reserved != -EEXIST)
+            failure(AE_FAIL_RESERVE, AE_REASON_BACKEND, reserved, network);
         return reserved == -EEXIST ? 1 : 2;
     }
     slot->id = id;
@@ -275,17 +291,45 @@ int create(void *, uint32_t network, uint32_t id, uint32_t *owned) {
     *owned = 1;
     const int error = configure29(id, &config);
     pthread_mutex_unlock(&gate);
+    if (error)
+        failure(AE_FAIL_CONFIGURE, AE_REASON_BACKEND, error, network);
     return error ? 2 : 0;
 }
-int check(void *, uint32_t network, uint32_t id) {
+int check_config(uint32_t network, uint32_t id, const AeDnsConfig &original) {
+    last_failure = {};
     // The actor is the sole caller/writer; guards only inspect IDs under gate.
     const Record *record = find(id);
-    if (!record || record->network != network)
+    if (!record || record->network != network) {
+        failure(AE_FAIL_CHECK, AE_REASON_BACKEND, -ENOENT, network);
         return 1;
-    AeDnsConfig original{}, copy{};
-    return ae_backend_read(network, &original) || ae_backend_read(id, &copy) ||
-           std::memcmp(&original, &record->config, sizeof(original)) ||
-           std::memcmp(&copy, &record->config, sizeof(copy));
+    }
+    AeDnsConfig copy{};
+    if (ae_backend_read(id, &copy))
+        return 1;
+    if (std::memcmp(&original, &record->config, sizeof(original)))
+        return failure(AE_FAIL_CHECK, AE_REASON_CHANGED, -EAGAIN, network);
+    if (std::memcmp(&copy, &record->config, sizeof(copy)))
+        return failure(AE_FAIL_CHECK, AE_REASON_BACKEND, -EIO, network);
+    return 0;
+}
+int check(void *, uint32_t network, uint32_t id) {
+    AeDnsConfig original{};
+    if (ae_backend_read(network, &original))
+        return 1;
+    return check_config(network, id, original);
+}
+int validate(void *, const AeCacheBinding *bindings, uint32_t count, uint32_t discovered) {
+    if (discovered) {
+        uint32_t networks[AE_MAX_NETWORKS];
+        // Configurations read while discovering are consumed immediately, not
+        // cached for another request. Isolated caches are still checked too.
+        const int current = discover(networks, AE_MAX_NETWORKS, bindings, count);
+        return current < 0 || static_cast<uint32_t>(current) != count;
+    }
+    for (uint32_t i = 0; i < count; ++i)
+        if (check(nullptr, bindings[i].network_id, bindings[i].cache_id))
+            return 1;
+    return 0;
 }
 int destroy(void *, uint32_t id) {
     pthread_mutex_lock(&gate);
@@ -315,6 +359,7 @@ int networks(void *, uint32_t *output, uint32_t capacity) {
     return ae_backend_networks(output, capacity);
 }
 int routes(void *, uint32_t network, uint32_t id, AeDnsRoute *output, uint32_t capacity) {
+    last_failure = {};
     const Record *record = find(id);
     if (!output || !record || check(nullptr, network, id) || !record->config.server_count ||
         record->config.server_count > capacity) {
@@ -323,6 +368,8 @@ int routes(void *, uint32_t network, uint32_t id, AeDnsRoute *output, uint32_t c
                             "cache prepare: routes config invalid network=%u cache=%u",
                             network,
                             id);
+        if (!last_failure.stage)
+            failure(AE_FAIL_ROUTES, AE_REASON_INVALID_CONFIG, -EINVAL, network);
         return -EINVAL;
     }
     uint32_t mark = 0;
@@ -331,7 +378,7 @@ int routes(void *, uint32_t network, uint32_t id, AeDnsRoute *output, uint32_t c
                             "AsteriskEnhance",
                             "cache prepare: DNS mark unavailable network=%u",
                             network);
-        return -ENOTSUP;
+        return failure(AE_FAIL_ROUTES, AE_REASON_BACKEND, -ENOTSUP, network);
     }
     for (uint32_t i = 0; i < record->config.server_count; ++i) {
         AeDnsRoute route{};
@@ -481,7 +528,7 @@ bool ae_backend_init(const ZygiskNextAPI *api, int sdk, void *bridge, const char
                 return false;
             }
         }
-        read29 = reinterpret_cast<Read29>(dlsym(bridge, "ae_resolver_read_config"));
+        read29 = reinterpret_cast<Read29>(dlsym(bridge, "ae_resolver_read_config_detail"));
         reserve29 = reinterpret_cast<Cache29>(dlsym(bridge, "ae_resolver_reserve"));
         configure29 = reinterpret_cast<Configure29>(dlsym(bridge, "ae_resolver_configure"));
         destroy29 = reinterpret_cast<Cache29>(dlsym(bridge, "ae_resolver_destroy"));
@@ -496,24 +543,36 @@ bool ae_backend_ready() {
     return ready;
 }
 AeActorBackend ae_backend_callbacks() {
-    return {nullptr, create, check, destroy, inflight, now_ms, networks, routes};
+    return {nullptr, create, check, destroy, inflight, now_ms, networks, routes, failure_detail, validate};
 }
 int ae_backend_read(uint32_t network, AeDnsConfig *output) {
+    last_failure = {};
     if (!ready || !output)
         return -ENOTSUP;
-    return platform < 29 ? legacy_info(network, output) : read29(network, output);
+    uint32_t reason = AE_REASON_BACKEND;
+    const int error = platform < 29 ? legacy_info(network, output) : read29(network, output, &reason);
+    if (!error)
+        return 0;
+    if (error == -ENOENT) reason = AE_REASON_NOT_READY;
+    return failure(AE_FAIL_READ, reason, error, network);
 }
 int ae_backend_networks(uint32_t *output, uint32_t capacity) {
+    return discover(output, capacity, nullptr, 0);
+}
+static int discover(uint32_t *output, uint32_t capacity,
+                    const AeCacheBinding *expected, uint32_t expected_count) {
+    last_failure = {};
     if (!ready || !output || !capacity)
         return -ENOTSUP;
     if (platform >= 29) {
         const int available = ae_platform_list_caches(list29, output, capacity);
         if (available < 0)
-            return available;
+            return failure(AE_FAIL_DISCOVER, AE_REASON_BACKEND, available, 0);
         uint32_t count = 0;
         for (int i = 0; i < available; ++i) {
             AeDnsConfig config{};
-            const int error = read29(output[i], &config);
+            uint32_t reason = AE_REASON_BACKEND;
+            const int error = read29(output[i], &config, &reason);
             // Android also keeps caches for networks without configured DNS.
             // Keep them reserved, but do not clone them into a policy generation.
             if (error == -ENOENT)
@@ -524,8 +583,11 @@ int ae_backend_networks(uint32_t *output, uint32_t capacity) {
                                     "cache discovery: read network=%u error=%d",
                                     output[i],
                                     error);
-                return error;
+                return failure(AE_FAIL_READ, reason, error, output[i]);
             }
+            if (expected && (count >= expected_count || expected[count].network_id != output[i] ||
+                check_config(output[i], expected[count].cache_id, config)))
+                return -EAGAIN;
             output[count++] = output[i];
         }
         return static_cast<int>(count);
@@ -544,20 +606,19 @@ int ae_backend_networks(uint32_t *output, uint32_t capacity) {
                                 "cache discovery: read network=%u error=%d",
                                 id,
                                 error);
-            return error;
+            return failure(AE_FAIL_READ, AE_REASON_BACKEND, error, id);
         }
         if (count == capacity) {
             __android_log_print(ANDROID_LOG_ERROR,
                                 "AsteriskEnhance",
                                 "cache discovery: capacity exceeded capacity=%u",
                                 capacity);
-            return -EOVERFLOW;
+            return failure(AE_FAIL_DISCOVER, AE_REASON_CAPACITY, -EOVERFLOW, 0);
         }
+        if (expected && (count >= expected_count || expected[count].network_id != id ||
+            check_config(id, expected[count].cache_id, config)))
+            return -EAGAIN;
         output[count++] = id;
     }
-    if (!count)
-        __android_log_print(ANDROID_LOG_WARN,
-                            "AsteriskEnhance",
-                            "cache discovery: no configured DNS networks; resolver not ready");
     return static_cast<int>(count);
 }

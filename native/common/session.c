@@ -80,6 +80,8 @@ size_t ae_session_handle_until(void *memory,
     }
     enum AeResult result = AE_OK;
     int capabilities = 0;
+    int failure_details = 0;
+    int route_reply = 0;
     uint32_t route_count = 0;
     struct AeDnsRoute routes[AE_MAX_DNS_ROUTES];
     if (now >= request_deadline || key->request_id <= session->last_request || !key->instance ||
@@ -101,8 +103,11 @@ size_t ae_session_handle_until(void *memory,
                 result = AE_UNSUPPORTED;
             else {
                 result = ae_actor_prepare(session->actor, session->connection, key, &prepared);
-                if (result == AE_OK && prepared.consumer_version == 2U)
+                failure_details = result == AE_CACHE_ERROR;
+                if (result == AE_OK && prepared.consumer_version == 2U) {
+                    route_reply = 1;
                     route_count = ae_actor_routes(session->actor, routes, AE_MAX_DNS_ROUTES);
+                }
             }
         } else if (key->opcode >= AE_ACTIVATE && key->opcode <= AE_RELEASE) {
             struct AeWireHeader control = *key;
@@ -115,14 +120,16 @@ size_t ae_session_handle_until(void *memory,
     struct AeWireHeader reply = *key;
     reply.opcode = capabilities ? AE_CAPABILITIES : result == AE_OK ? AE_ACK : AE_ERROR;
     reply.body_length = capabilities ? AE_CAPABILITIES_SIZE : AE_RESULT_SIZE;
-    if (route_count)
+    if (failure_details)
+        reply.body_length += 16U;
+    if (route_reply)
         reply.body_length += 4U + route_count * 32U;
     if (!ae_wire_encode(&reply, output, capacity))
         return 0;
     uint8_t *bytes = (uint8_t *)output + AE_WIRE_HEADER_SIZE;
     put(bytes, session->netd_instance, 8);
     if (capabilities) {
-        const uint32_t values[] = {5,
+        const uint32_t values[] = {7,
                                    session->api,
                                    session->modes,
                                    AE_MARK_MASK,
@@ -139,7 +146,14 @@ size_t ae_session_handle_until(void *memory,
         put(bytes + 12, ae_actor_phase(session->actor), 4);
         put(bytes + 16, ae_actor_resource_count(session->actor), 4);
         put(bytes + 20, 0, 4);
-        if (route_count) {
+        if (failure_details) {
+            const struct AeFailure failure = ae_actor_failure(session->actor);
+            put(bytes + 24, failure.stage, 4);
+            put(bytes + 28, failure.reason, 4);
+            put(bytes + 32, (uint32_t)failure.error, 4);
+            put(bytes + 36, failure.network, 4);
+        }
+        if (route_reply) {
             put(bytes + 24, route_count, 4);
             for (uint32_t i = 0; i < route_count; ++i) {
                 uint8_t *entry = bytes + 28U + i * 32U;

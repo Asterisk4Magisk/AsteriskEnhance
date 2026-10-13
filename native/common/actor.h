@@ -4,6 +4,7 @@
 #pragma once
 #include "prepare.h"
 #include "wire.h"
+#include "failure.h"
 
 enum AeResult {
     AE_OK = 0,
@@ -45,6 +46,11 @@ struct AeActorBackend {
     // Exact original config/mark for one already reserved network/cache pair.
     int (*routes)(
         void *, uint32_t network_id, uint32_t cache_id, struct AeDnsRoute *, uint32_t capacity);
+    // Optional thread-local detail from the immediately preceding backend call.
+    struct AeFailure (*failure)(void *);
+    // Optional single-operation inventory/config validation. No snapshots may
+    // be reused across separate ACTIVATE/CHECK requests.
+    int (*validate)(void *, const struct AeCacheBinding *, uint32_t count, uint32_t discovered);
 };
 // All actor methods run on one background writer. Resolver readers use store.
 #ifdef __cplusplus
@@ -73,6 +79,7 @@ AE_EXPORT void ae_actor_reap(void *);
 AE_EXPORT int ae_actor_poll_timeout(const void *);
 AE_EXPORT uint32_t ae_actor_phase(const void *);
 AE_EXPORT uint32_t ae_actor_resource_count(const void *);
+AE_EXPORT struct AeFailure ae_actor_failure(const void *);
 AE_EXPORT uint32_t ae_actor_routes(const void *, struct AeDnsRoute *, uint32_t capacity);
 #ifdef __cplusplus
 }

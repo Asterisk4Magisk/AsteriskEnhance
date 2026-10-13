@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0
 
 #include "resolver_bridge.h"
+#include "../common/failure.h"
 #include <aidl/android/net/BpDnsResolver.h>
 #include <aidl/android/net/ResolverParamsParcel.h>
 #include <cerrno>
@@ -22,7 +23,7 @@ ndk::SpAIBinder service() {
     // Service-manager entrypoints are platform APIs, not in the application
     // NDK stub library. Resolve the documented C signature in privileged netd.
     using CheckService = AIBinder *(*)(const char *);
-    auto check =
+    static const auto check =
         reinterpret_cast<CheckService>(dlsym(RTLD_DEFAULT, "AServiceManager_checkService"));
     return ndk::SpAIBinder(check ? check("dnsresolver") : nullptr);
 }
@@ -31,8 +32,9 @@ bool valid_id(uint32_t id) {
 }
 } // namespace
 
-extern "C" __attribute__((visibility("default"))) int ae_resolver_read_config(uint32_t id,
-                                                                              AeDnsConfig *output) {
+extern "C" __attribute__((visibility("default"))) int ae_resolver_read_config_detail(
+    uint32_t id, AeDnsConfig *output, uint32_t *reason) {
+    *reason = AE_REASON_BACKEND;
     if (!output || !valid_id(id))
         return -EINVAL;
     auto binder = service();
@@ -50,16 +52,23 @@ extern "C" __attribute__((visibility("default"))) int ae_resolver_read_config(ui
     const int error = status_error(status);
     if (error)
         return error;
-    if (servers.empty())
+    if (servers.empty()) {
+        *reason = AE_REASON_NOT_READY;
         return -ENOENT;
-    if (!tls.empty())
+    }
+    if (!tls.empty()) {
+        *reason = AE_REASON_PRIVATE_DNS;
         return -ENOTSUP; // Private DNS is outside this design.
+    }
     std::string prefix;
     const int prefix_error = status_error(proxy->getPrefix64(static_cast<int32_t>(id), &prefix));
-    if (!prefix_error)
+    if (!prefix_error) {
+        *reason = AE_REASON_NAT64;
         return -ENOTSUP; // Do not omit an active DNS64/NAT64 prefix.
+    }
     if (prefix_error != -ENOENT)
         return prefix_error;
+    *reason = AE_REASON_INVALID_CONFIG;
     if (servers.size() > 8 || domains.size() > 6 || params.size() != 6)
         return -EOVERFLOW;
     AeDnsConfig result{};
@@ -78,6 +87,7 @@ extern "C" __attribute__((visibility("default"))) int ae_resolver_read_config(ui
     for (size_t i = 0; i < params.size(); ++i)
         result.parameters[i] = params[i];
     *output = result;
+    *reason = AE_REASON_NONE;
     return 0;
 }
 

@@ -38,7 +38,7 @@ reservation still treats those entries as occupied. A newly configured network
 changes the discovered inventory and requires a new policy generation. INFO
 reports module capabilities; it does not guarantee that the system has published
 DNS configuration. PREPARE fails when no configured DNS network is available.
-Resolver preparation failures are logged under the `AsteriskEnhance` logcat tag.
+Resolver preparation failures are logged under the `AsteriskEnhance` logcat tag and returned to the supervisor with stage, reason, underlying error and network ID. Startup reports retain the cause even after logcat rotates. Only known transient preparation failures with complete cleanup receive bounded startup retries.
 
 ## Missed netd injection recovery
 
@@ -134,7 +134,7 @@ and lifecycle requirements.
 Idle control workers wait for events. Policies last until explicit withdrawal or
 control-connection loss, with no heartbeat or periodic renewal. Resolver changes
 trigger configuration checks and fresh cache generations when needed. A stalled
-supervisor with an open connection retains its last policy. Capability revision 5
+supervisor with an open connection retains its last policy. Capability revision 7
 requires matching application support.
 
 ## License

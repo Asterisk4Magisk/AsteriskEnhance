@@ -9,12 +9,14 @@ struct AeActor {
     struct AeActorBackend backend;
     uint64_t netd_instance, connection;
     struct AeWireHeader key;
-    uint32_t phase, auto_release, modes, seed, used_ids, owned_count, discovered;
+    uint32_t phase, auto_release, modes, seed, used_ids, owned_count, discovered, guarded;
     struct AePolicy policy;
     uint32_t uids[AE_MAX_UIDS], bypass[AE_MAX_UIDS];
     struct AeCacheBinding caches[AE_MAX_NETWORKS];
     uint32_t route_count;
     struct AeDnsRoute routes[AE_MAX_DNS_ROUTES];
+    struct AeFailure failure;
+    uint32_t cleanup_failed;
 };
 size_t ae_actor_size(void) {
     return sizeof(struct AeActor);
@@ -41,9 +43,22 @@ int ae_actor_init(void *memory,
     actor->used_ids = 0;
     actor->owned_count = 0;
     actor->discovered = 0;
+    actor->guarded = 0;
     actor->policy = (struct AePolicy){0};
     actor->route_count = 0;
+    actor->failure = (struct AeFailure){0};
+    actor->cleanup_failed = 0;
     return 1;
+}
+static void failed(struct AeActor *actor, uint32_t stage, uint32_t reason, int error,
+                   uint32_t network) {
+    actor->failure = actor->backend.failure ? actor->backend.failure(actor->backend.opaque)
+                                           : (struct AeFailure){0};
+    if (!actor->failure.stage)
+        actor->failure = (struct AeFailure){stage, reason, error, network};
+}
+struct AeFailure ae_actor_failure(const void *memory) {
+    return memory ? ((const struct AeActor *)memory)->failure : (struct AeFailure){0};
 }
 static int key_valid(uint64_t connection, const struct AeWireHeader *key) {
     return connection && key && key->instance && key->cycle && key->generation;
@@ -56,12 +71,15 @@ key_matches(const struct AeActor *actor, uint64_t connection, const struct AeWir
 }
 static void withdraw(struct AeActor *actor, int automatic) {
     ae_store_revoke(actor->store);
+    actor->guarded = 0;
     actor->policy.active = 0;
     actor->phase = AE_STATE_DRAINING;
+    actor->cleanup_failed = 0;
     if (automatic)
         actor->auto_release = 1;
 }
 static enum AeResult release_resources(struct AeActor *actor) {
+    actor->cleanup_failed = 0;
     if (!ae_store_quiescent(actor->store) || actor->backend.inflight(actor->backend.opaque))
         return AE_DRAINING;
     uint32_t retained = 0;
@@ -70,8 +88,10 @@ static enum AeResult release_resources(struct AeActor *actor) {
             actor->caches[retained++] = actor->caches[i];
     }
     actor->owned_count = retained;
-    if (retained)
+    if (retained) {
+        actor->cleanup_failed = 1;
         return AE_CACHE_ERROR;
+    }
     actor->phase = AE_STATE_IDLE;
     actor->auto_release = 0;
     return AE_OK;
@@ -88,7 +108,7 @@ int ae_actor_poll_timeout(const void *memory) {
     if (!actor)
         return -1;
     // Retained resolver workers may finish without a control-channel event.
-    if (actor->phase == AE_STATE_DRAINING && actor->auto_release)
+    if (actor->phase == AE_STATE_DRAINING && actor->auto_release && !actor->cleanup_failed)
         return 1000;
     return -1;
 }
@@ -96,14 +116,17 @@ void ae_actor_disconnect(void *memory, uint64_t connection) {
     if (!memory)
         return;
     struct AeActor *actor = memory;
-    if (connection && actor->connection == connection && actor->phase != AE_STATE_IDLE)
+    if (connection && actor->connection == connection)
         withdraw(actor, 1);
 }
 static int configurations_current(struct AeActor *actor) {
+    if (actor->backend.validate)
+        return actor->backend.validate(actor->backend.opaque, actor->caches,
+                                       actor->owned_count, actor->discovered) == 0;
     if (actor->discovered) {
         uint32_t networks[AE_MAX_NETWORKS];
         const int count = actor->backend.networks(actor->backend.opaque, networks, AE_MAX_NETWORKS);
-        if (count < 1 || (uint32_t)count != actor->owned_count)
+        if (count < 0 || (uint32_t)count != actor->owned_count)
             return 0;
         for (uint32_t i = 0; i < actor->owned_count; ++i)
             if (networks[i] != actor->caches[i].network_id)
@@ -125,6 +148,7 @@ enum AeResult ae_actor_prepare(void *memory,
         return AE_INVALID;
     struct AeActor *actor = memory;
     ae_actor_reap(actor);
+    actor->failure = (struct AeFailure){0};
     if (input->netd_instance != actor->netd_instance)
         return AE_STALE;
     if (!(actor->modes & (1U << (input->run_mode - 1))) || input->mark_mask != AE_MARK_MASK ||
@@ -139,12 +163,17 @@ enum AeResult ae_actor_prepare(void *memory,
         if (!actor->backend.networks)
             return AE_UNSUPPORTED;
         const int count = actor->backend.networks(actor->backend.opaque, networks, AE_MAX_NETWORKS);
-        if (count < 1 || count > (int)AE_MAX_NETWORKS)
+        if (count < 0 || count > (int)AE_MAX_NETWORKS) {
+            failed(actor, AE_FAIL_DISCOVER, count == 0 ? AE_REASON_NOT_READY : AE_REASON_BACKEND,
+                   count < 0 ? count : 0, 0);
             return AE_CACHE_ERROR;
+        }
         resolved.network_count = (uint32_t)count;
         resolved.networks = networks;
-        if (!ae_prepare_valid(&resolved))
+        if (!ae_prepare_valid(&resolved)) {
+            actor->failure = (struct AeFailure){AE_FAIL_DISCOVER, AE_REASON_INVALID_CONFIG, 0, 0};
             return AE_CACHE_ERROR;
+        }
         input = &resolved;
     }
     if ((actor->connection == connection && actor->key.instance &&
@@ -193,6 +222,7 @@ enum AeResult ae_actor_prepare(void *memory,
             if (result == 0 && owned == 1)
                 created = 1;
             else if (result != 1 || owned) {
+                failed(actor, AE_FAIL_RESERVE, AE_REASON_BACKEND, result, input->networks[i]);
                 error = AE_CACHE_ERROR;
                 break;
             }
@@ -200,7 +230,7 @@ enum AeResult ae_actor_prepare(void *memory,
         if (!created && error == AE_OK)
             error = AE_BUSY;
     }
-    if (error == AE_OK && input->consumer_version == 2U) {
+    if (error == AE_OK && input->consumer_version >= 2U) {
         if (!actor->backend.routes)
             error = AE_UNSUPPORTED;
         for (uint32_t i = 0; i < actor->owned_count && error == AE_OK; ++i) {
@@ -214,6 +244,7 @@ enum AeResult ae_actor_prepare(void *memory,
                                                                 remaining)
                                         : -1;
             if (count < 1 || (uint32_t)count > remaining) {
+                failed(actor, AE_FAIL_ROUTES, AE_REASON_BACKEND, count, binding->network_id);
                 error = AE_CACHE_ERROR;
                 break;
             }
@@ -230,11 +261,17 @@ enum AeResult ae_actor_prepare(void *memory,
                             error = AE_CACHE_ERROR;
             }
             actor->route_count += (uint32_t)count;
+            if (error != AE_OK)
+                actor->failure = (struct AeFailure){AE_FAIL_ROUTES, AE_REASON_INVALID_CONFIG, 0,
+                                                   binding->network_id};
         }
     }
     if (error != AE_OK) {
         actor->route_count = 0;
-        withdraw(actor, 0);
+        if (actor->guarded) {
+            actor->phase = AE_STATE_DRAINING;
+            actor->auto_release = 0;
+        } else withdraw(actor, 0);
         release_resources(actor); // Retain failed deletions for RELEASE/disconnect.
         return error;
     }
@@ -260,8 +297,11 @@ enum AeResult ae_actor_control_until(void *memory,
     if (!key_matches(actor, connection, key))
         return AE_STALE;
     if (key->opcode == AE_DEACTIVATE) {
-        if (actor->phase == AE_STATE_IDLE)
+        if (actor->phase == AE_STATE_IDLE) {
+            ae_store_revoke(actor->store); // Automatic drain may retain a waiting guard.
+            actor->guarded = 0;
             return AE_OK; // Exact identity already withdrew and drained.
+        }
         withdraw(actor, 0);
         return AE_OK;
     }
@@ -275,7 +315,16 @@ enum AeResult ae_actor_control_until(void *memory,
         (!activating && actor->phase != AE_STATE_ACTIVE))
         return AE_STALE;
     if (!configurations_current(actor)) {
-        withdraw(actor, 1);
+        // Preserve UID decisions while rebuilding: selected queries must not
+        // fall back to a shared resolver cache when their network disappears.
+        struct AePolicy guard = actor->policy;
+        guard.active = 1;
+        guard.cache_count = 0;
+        if (!ae_store_publish(actor->store, &guard))
+            return AE_BUSY;
+        actor->guarded = 1;
+        actor->phase = AE_STATE_DRAINING;
+        actor->auto_release = 1;
         return AE_CACHE_ERROR;
     }
     // Configuration checks can block in Binder; honor the caller's request budget.
@@ -291,6 +340,7 @@ enum AeResult ae_actor_control_until(void *memory,
     if (!ae_store_publish(actor->store, &policy))
         return AE_BUSY;
     actor->policy = policy;
+    actor->guarded = policy.cache_count == 0;
     actor->phase = AE_STATE_ACTIVE;
     return AE_OK;
 }

@@ -25,8 +25,8 @@ int ae_policy_valid(const struct AePolicy *policy) {
         policy->proxy_mark == policy->direct_mark || (policy->proxy_mark & ~policy->mark_mask) ||
         (policy->direct_mark & ~policy->mark_mask) ||
         !sorted_uids(policy->uids, policy->uid_count) ||
-        !sorted_uids(policy->bypass_uids, policy->bypass_count) || !policy->cache_count ||
-        policy->cache_count > AE_MAX_NETWORKS || !policy->caches)
+        !sorted_uids(policy->bypass_uids, policy->bypass_count) ||
+        policy->cache_count > AE_MAX_NETWORKS || (policy->cache_count && !policy->caches))
         return 0;
     for (uint32_t i = 0; i < policy->cache_count; ++i) {
         const struct AeCacheBinding *entry = &policy->caches[i];
@@ -72,8 +72,13 @@ ae_policy_apply(const struct AePolicy *policy, uint64_t instance_id, struct AeCo
                 break;
             }
         }
-        if (!cache)
+        if (!cache) {
+            // Outside both Android's real-netId range and our allocated cache
+            // range. No cache is ever created here: resolver lookup must fail.
+            context->dns_netid = 0x7fffffffU;
+            context->dns_mark = (context->dns_mark & ~policy->mark_mask) | policy->proxy_mark;
             return AE_CACHE_MISSING;
+        }
     }
     if (selected)
         context->dns_netid = cache;
