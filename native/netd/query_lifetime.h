@@ -10,3 +10,5 @@ bool ae_query_tracking_ready();
 bool ae_query_in_command();
 int ae_query_observe(void *, uint64_t generation, uint32_t cache_id);
 uint32_t ae_query_inflight();
+// Arms one ae_runtime_drained() call for when no tracked query remains.
+void ae_query_wait_drain();

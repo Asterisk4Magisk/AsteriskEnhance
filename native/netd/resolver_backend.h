@@ -13,7 +13,9 @@ bool ae_backend_init(const ZygiskNextAPI *,
                      const char *resolver_path);
 bool ae_backend_ready();
 // Uses the verified original controller function, never the decorating hook.
-bool ae_original_dns_mark(uint32_t network, uint32_t *mark);
+// Returns 0, -EAGAIN when netd no longer resolves the network to itself
+// (destroyed before its resolver cache), or -ENOTSUP.
+int ae_original_dns_mark(uint32_t network, uint32_t *mark);
 AeActorBackend ae_backend_callbacks();
 int ae_backend_read(uint32_t network, AeDnsConfig *);
 int ae_backend_networks(uint32_t *output, uint32_t capacity);

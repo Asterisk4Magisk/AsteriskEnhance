@@ -17,7 +17,7 @@
 #include <unistd.h>
 namespace {
 pthread_mutex_t writer = PTHREAD_MUTEX_INITIALIZER;
-std::atomic<int> network_event{-1};
+std::atomic<int> network_event{-1}, drain_event{-1};
 void *actor = nullptr;
 void *session = nullptr;
 std::vector<uint8_t> runtime_info;
@@ -35,6 +35,11 @@ bool ae_runtime_init(uint64_t instance, uint32_t api, uint32_t modes, uint32_t f
     const int event = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (event < 0)
         return false;
+    const int drained = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (drained < 0) {
+        close(event);
+        return false;
+    }
     actor = std::calloc(1, ae_actor_size());
     session = std::calloc(1, ae_session_size());
     const auto backend = ae_backend_callbacks();
@@ -44,6 +49,7 @@ bool ae_runtime_init(uint64_t instance, uint32_t api, uint32_t modes, uint32_t f
         std::free(actor);
         std::free(session);
         close(event);
+        close(drained);
         actor = nullptr;
         session = nullptr;
         return false;
@@ -65,11 +71,11 @@ bool ae_runtime_init(uint64_t instance, uint32_t api, uint32_t modes, uint32_t f
         return false;
     runtime_info.assign(text, text + length);
     network_event.store(event);
+    drain_event.store(drained);
     return true;
 }
-void ae_runtime_network_changed() {
-    // Called by resolver hooks. Never take the writer lock or call Binder here.
-    const int event = network_event.load();
+namespace {
+void signal(int event) {
     if (event >= 0) {
         const uint64_t one = 1;
         ssize_t result;
@@ -77,6 +83,22 @@ void ae_runtime_network_changed() {
             result = write(event, &one, sizeof(one));
         } while (result < 0 && errno == EINTR);
     }
+}
+void consume(int event) {
+    uint64_t changes;
+    ssize_t result;
+    do {
+        result = read(event, &changes, sizeof(changes));
+    } while (result < 0 && errno == EINTR);
+}
+} // namespace
+void ae_runtime_network_changed() {
+    // Called by resolver hooks. Never take the writer lock or call Binder here.
+    signal(network_event.load());
+}
+void ae_runtime_drained() {
+    // Called by resolver threads; the serving thread reaps under the writer lock.
+    signal(drain_event.load());
 }
 void ae_runtime_reap() {
     AeRuntimeGuard guard;
@@ -93,25 +115,33 @@ void ae_runtime_serve(int channel) {
     uint64_t current = 0;
     for (;;) {
         ae_runtime_reap();
-        pollfd events[] = {{channel, POLLIN, 0}, {network_event.load(), POLLIN, 0}};
+        pollfd events[] = {{channel, POLLIN, 0},
+                           {network_event.load(), POLLIN, 0},
+                           {drain_event.load(), POLLIN, 0}};
         int timeout;
         {
             AeRuntimeGuard guard;
             timeout = ae_actor_poll_timeout(actor);
         }
-        const int ready = poll(events, 2, timeout);
+        const int ready = poll(events, 3, timeout);
         if (ready < 0 && errno == EINTR)
             continue;
         if (ready < 0)
             break;
         if (!ready)
             continue;
+        bool notify = false;
+        if (events[2].revents & POLLIN) {
+            consume(events[2].fd);
+            // Finish automatic cleanup now; a waiting client retries RELEASE.
+            ae_runtime_reap();
+            notify = true;
+        }
         if (events[1].revents & POLLIN) {
-            uint64_t changes;
-            ssize_t result;
-            do {
-                result = read(events[1].fd, &changes, sizeof(changes));
-            } while (result < 0 && errno == EINTR);
+            consume(events[1].fd);
+            notify = true;
+        }
+        if (notify) {
             if (current) {
                 AeWireHeader changed{AE_NETWORK_CHANGED, 0, 1, 0, 0, 0};
                 std::vector<uint8_t> empty;

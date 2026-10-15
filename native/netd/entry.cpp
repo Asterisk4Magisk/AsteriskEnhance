@@ -42,6 +42,14 @@ struct NetContext28 {
 static_assert(sizeof(NetContext28) == 24 + sizeof(void *));
 static_assert(sizeof(NetContext26) == 20);
 std::atomic<bool> controller_constructed{false};
+pthread_mutex_t controller_gate = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t controller_ready = PTHREAD_COND_INITIALIZER;
+void mark_controller_constructed() {
+    pthread_mutex_lock(&controller_gate);
+    controller_constructed.store(true);
+    pthread_cond_broadcast(&controller_ready);
+    pthread_mutex_unlock(&controller_gate);
+}
 using ContextFunction = void (*)(const void *, uint32_t, uint32_t, void *);
 ContextFunction original_context = nullptr;
 std::atomic<const void *> network_controller{nullptr};
@@ -59,11 +67,11 @@ Result construct_controller(Result (*original)(void *), void *controller) {
     if constexpr (std::is_void<Result>::value) {
         original(controller);
         network_controller.store(controller, std::memory_order_release);
-        controller_constructed.store(true);
+        mark_controller_constructed();
     } else {
         Result result = original(controller);
         network_controller.store(controller, std::memory_order_release);
-        controller_constructed.store(true);
+        mark_controller_constructed();
         return result;
     }
 }
@@ -214,25 +222,51 @@ const char *find_resolver_image(const ZygiskNextAPI *api) {
     return nullptr;
 }
 
+void wait_boot_completed() {
+    // Block on property updates instead of sampling the property every second.
+    for (;;) {
+        // Read serials before values, so an update in between still wakes us.
+        uint32_t serial = __system_property_area_serial();
+        const prop_info *info = __system_property_find("sys.boot_completed");
+        const uint32_t current = info ? __system_property_serial(info) : 0;
+        char boot[PROP_VALUE_MAX]{};
+        if (info && __system_property_get("sys.boot_completed", boot) && !std::strcmp(boot, "1"))
+            return;
+        if (info) {
+            uint32_t next = 0;
+            if (!__system_property_wait(info, current, &next, nullptr))
+                sleep(1);
+        } else if (!__system_property_wait(nullptr, serial, &serial, nullptr)) {
+            sleep(1);
+        }
+    }
+}
+
 void *background_runtime(void *) {
-    char boot[PROP_VALUE_MAX]{};
-    while (!__system_property_get("sys.boot_completed", boot) || std::strcmp(boot, "1"))
-        sleep(1);
+    wait_boot_completed();
     // Module loading precedes main even when netd restarts after boot. Wait for
     // the real controller before fixing this process's capability snapshot.
-    while (hook_installed.load() && !controller_constructed.load())
-        sleep(1);
+    if (hook_installed.load()) {
+        pthread_mutex_lock(&controller_gate);
+        while (!controller_constructed.load())
+            pthread_cond_wait(&controller_ready, &controller_gate);
+        pthread_mutex_unlock(&controller_gate);
+    }
     if (platform_api >= 29)
         resolver_path = find_resolver_image(&runtime_api);
     if (hook_installed.load() && (platform_api < 29 || resolver_path))
         ae_query_install(
             &runtime_api, platform_api < 29 ? "/system/bin/netd" : resolver_path, platform_api);
     bool initialized = false;
+    // A missing or rejecting companion has no readiness event; back off so a
+    // permanently unavailable daemon does not wake netd every second.
+    unsigned retry_seconds = 1;
     for (;;) {
         ae_runtime_reap();
         const int companion = runtime_api.connectCompanion(module_handle);
         if (companion < 0) {
-            sleep(1);
+            sleep(retry_seconds);
+            retry_seconds = retry_seconds < 64 ? retry_seconds * 2 : 64;
             continue;
         }
         timeval timeout{2, 0};
@@ -250,7 +284,8 @@ void *background_runtime(void *) {
                 if (hook_installed.load())
                     ae_backend_init(&runtime_api, platform_api, modern_bridge, resolver_path);
                 uint32_t modes = 0, flags = ae_backend_ready()
-                                                ? (AE_CAP_NETWORK_DISCOVERY | AE_CAP_DNS_ROUTES)
+                                                ? (AE_CAP_NETWORK_DISCOVERY | AE_CAP_DNS_ROUTES |
+                                                   AE_CAP_DRAIN_EVENTS)
                                                 : 0;
                 // Publish capabilities only after context hooks, resolver access
                 // and query lifetime tracking are ready. The supervisor/helper
@@ -261,11 +296,15 @@ void *background_runtime(void *) {
                 initialized = ae_runtime_init(
                     netd_instance, static_cast<uint32_t>(platform_api), modes, flags);
             }
-            if (initialized)
+            if (initialized) {
                 ae_runtime_serve(companion);
+                retry_seconds = 1; // A served channel ended; reconnect promptly.
+            }
         }
         close(companion);
-        sleep(1);
+        sleep(retry_seconds);
+        if (!initialized || !connected)
+            retry_seconds = retry_seconds < 64 ? retry_seconds * 2 : 64;
     }
 }
 
@@ -429,11 +468,11 @@ void companion_connected(int fd) {
 }
 } // namespace
 
-bool ae_original_dns_mark(uint32_t network, uint32_t *mark) {
+int ae_original_dns_mark(uint32_t network, uint32_t *mark) {
     const void *controller = network_controller.load(std::memory_order_acquire);
     if (!mark || !controller || !original_context || !hook_installed.load() || !network ||
         network > 0xffffU)
-        return false;
+        return -ENOTSUP;
     // Platform contexts append flags, qhook or pid to the stable 20-byte prefix.
     alignas(8) uint8_t context[64]{};
     const bool nested = inside_original_context;
@@ -442,10 +481,15 @@ bool ae_original_dns_mark(uint32_t network, uint32_t *mark) {
     inside_original_context = nested;
     AeContext prefix{};
     std::memcpy(&prefix, context, sizeof(prefix));
-    if (prefix.dns_netid != network || prefix.uid || (prefix.dns_mark & AE_MARK_MASK))
-        return false;
+    // ConnectivityService destroys the netd network before its resolver cache.
+    // In that window netd falls back to another network; the caller retries
+    // after the following resolver change event.
+    if (prefix.dns_netid != network)
+        return -EAGAIN;
+    if (prefix.uid || (prefix.dns_mark & AE_MARK_MASK))
+        return -ENOTSUP;
     *mark = prefix.dns_mark;
-    return true;
+    return 0;
 }
 
 extern "C" {

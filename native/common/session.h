@@ -8,6 +8,8 @@
 #define AE_RESPONSE_MAX_SIZE (AE_WIRE_HEADER_SIZE + AE_RESULT_SIZE + 4U + AE_MAX_DNS_ROUTES * 32U)
 #define AE_CAP_NETWORK_DISCOVERY 2U
 #define AE_CAP_DNS_ROUTES 4U
+// Unsolicited NETWORK_CHANGED also reports that a waiting release may proceed.
+#define AE_CAP_DRAIN_EVENTS 8U
 #ifdef __cplusplus
 extern "C" {
 #endif

@@ -7,6 +7,8 @@ bool ae_runtime_init(uint64_t instance, uint32_t api, uint32_t modes, uint32_t f
 void ae_runtime_serve(int companion_channel);
 void ae_runtime_reap();
 void ae_runtime_network_changed();
+// Called from resolver threads when a waiting release can proceed.
+void ae_runtime_drained();
 void ae_runtime_lock();
 void ae_runtime_unlock();
 class AeRuntimeGuard {

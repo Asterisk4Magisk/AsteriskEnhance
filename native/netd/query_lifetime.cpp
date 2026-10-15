@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0
 
 #include "query_lifetime.h"
+#include "runtime.h"
 #include <atomic>
 #include <cerrno>
 #include <cstddef>
@@ -19,6 +20,12 @@ unsigned routine_count = 0;
 bool track_command_threads = false;
 std::atomic<bool> ready{false};
 std::atomic<uint32_t> inflight{0}, cursor{0};
+std::atomic<bool> drain_waiting{false};
+void release_reference() {
+    // Wake a waiting release exactly once, when the last tracked query ends.
+    if (inflight.fetch_sub(1) == 1 && drain_waiting.exchange(false))
+        ae_runtime_drained();
+}
 thread_local unsigned command_depth = 0;
 thread_local uint64_t selected_generation = 0;
 struct Slot {
@@ -34,7 +41,7 @@ int run_command(unsigned index, void *self, void *client, int argc, char **argv)
     --command_depth;
     if (!command_depth && selected_generation) {
         selected_generation = 0;
-        inflight.fetch_sub(1);
+        release_reference();
     }
     return result;
 }
@@ -56,7 +63,7 @@ void *tracked_start(void *pointer) {
     const Routine routine = slot->routine;
     void *argument = slot->argument;
     void *result = routine(argument); // Includes handler destruction and TCP retries.
-    inflight.fetch_sub(1);
+    release_reference();
     slot->busy.store(false, std::memory_order_release);
     return result;
 }
@@ -87,7 +94,7 @@ int create_thread(pthread_t *thread, const pthread_attr_t *attrs, Routine routin
         selected_generation = 0; // Transfer the command's existing reference to the worker.
     const int result = original_create(thread, attrs, tracked_start, slot);
     if (result) {
-        inflight.fetch_sub(1);
+        release_reference();
         slot->busy.store(false, std::memory_order_release);
     }
     return result;
@@ -102,6 +109,12 @@ bool ae_query_in_command() {
 }
 uint32_t ae_query_inflight() {
     return inflight.load();
+}
+void ae_query_wait_drain() {
+    drain_waiting.store(true);
+    // Store readers or a query that ended before arming leave no later edge.
+    if (!inflight.load() && drain_waiting.exchange(false))
+        ae_runtime_drained();
 }
 int ae_query_observe(void *, uint64_t generation, uint32_t) {
     if (!ae_query_in_command() || !generation)

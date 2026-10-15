@@ -18,7 +18,7 @@ size_t ae_session_size(void) {
 int ae_session_init(
     void *memory, void *actor, uint64_t instance, uint32_t api, uint32_t modes, uint32_t flags) {
     if (!memory || !actor || !instance || !api || (modes & ~7U) ||
-        (flags & ~(AE_CAP_NETWORK_DISCOVERY | AE_CAP_DNS_ROUTES)))
+        (flags & ~(AE_CAP_NETWORK_DISCOVERY | AE_CAP_DNS_ROUTES | AE_CAP_DRAIN_EVENTS)))
         return 0;
     struct AeSession *session = memory;
     session->actor = actor;

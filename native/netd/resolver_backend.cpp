@@ -123,14 +123,24 @@ int prefix_set(void *controller, unsigned network, const void *prefix) {
     ae_runtime_network_changed();
     return result;
 }
+// ResolverParamsParcel is an NDK parcelable without virtual members; netId is
+// its first AIDL field in every revision.
+uint32_t parcel_network(const void *params) {
+    int32_t network = 0;
+    std::memcpy(&network, params, sizeof(network));
+    return static_cast<uint32_t>(network);
+}
 int configure_changed(void *controller, const void *params) {
     const int result = original_resolver_configure(controller, params);
-    ae_runtime_network_changed();
+    // Isolated caches are configured by PREPARE itself, not by a topology change.
+    if (!params || !candidate(parcel_network(params)))
+        ae_runtime_network_changed();
     return result;
 }
 int configure_changed29(void *controller, const void *params, const void *fingerprints) {
     const int result = original_resolver_configure29(controller, params, fingerprints);
-    ae_runtime_network_changed();
+    if (!params || !candidate(parcel_network(params)))
+        ae_runtime_network_changed();
     return result;
 }
 void delete_changed(void *controller, unsigned id) {
@@ -356,6 +366,9 @@ int destroy(void *, uint32_t id) {
 uint32_t inflight(void *) {
     return ae_query_inflight();
 }
+void drain_wait(void *) {
+    ae_query_wait_drain();
+}
 int networks(void *, uint32_t *output, uint32_t capacity) {
     return ae_backend_networks(output, capacity);
 }
@@ -374,12 +387,17 @@ int routes(void *, uint32_t network, uint32_t id, AeDnsRoute *output, uint32_t c
         return -EINVAL;
     }
     uint32_t mark = 0;
-    if (!ae_original_dns_mark(network, &mark)) {
+    const int mark_error = ae_original_dns_mark(network, &mark);
+    if (mark_error) {
         __android_log_print(ANDROID_LOG_ERROR,
                             "AsteriskEnhance",
-                            "cache prepare: DNS mark unavailable network=%u",
-                            network);
-        return failure(AE_FAIL_ROUTES, AE_REASON_BACKEND, -ENOTSUP, network);
+                            "cache prepare: DNS mark unavailable network=%u error=%d",
+                            network,
+                            mark_error);
+        return failure(AE_FAIL_ROUTES,
+                       mark_error == -EAGAIN ? AE_REASON_CHANGED : AE_REASON_BACKEND,
+                       mark_error,
+                       network);
     }
     for (uint32_t i = 0; i < record->config.server_count; ++i) {
         AeDnsRoute route{};
@@ -550,7 +568,17 @@ bool ae_backend_ready() {
     return ready;
 }
 AeActorBackend ae_backend_callbacks() {
-    return {nullptr, create, check, destroy, inflight, now_ms, networks, routes, failure_detail, validate};
+    return {nullptr,
+            create,
+            check,
+            destroy,
+            inflight,
+            now_ms,
+            networks,
+            routes,
+            failure_detail,
+            validate,
+            drain_wait};
 }
 int ae_backend_read(uint32_t network, AeDnsConfig *output) {
     last_failure = {};

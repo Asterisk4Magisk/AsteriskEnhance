@@ -80,8 +80,11 @@ static void withdraw(struct AeActor *actor, int automatic) {
 }
 static enum AeResult release_resources(struct AeActor *actor) {
     actor->cleanup_failed = 0;
-    if (!ae_store_quiescent(actor->store) || actor->backend.inflight(actor->backend.opaque))
+    if (!ae_store_quiescent(actor->store) || actor->backend.inflight(actor->backend.opaque)) {
+        if (actor->backend.drain_wait)
+            actor->backend.drain_wait(actor->backend.opaque);
         return AE_DRAINING;
+    }
     uint32_t retained = 0;
     for (uint32_t i = 0; i < actor->owned_count; ++i) {
         if (actor->backend.destroy(actor->backend.opaque, actor->caches[i].cache_id))
@@ -108,7 +111,9 @@ int ae_actor_poll_timeout(const void *memory) {
     if (!actor)
         return -1;
     // Retained resolver workers may finish without a control-channel event.
-    if (actor->phase == AE_STATE_DRAINING && actor->auto_release && !actor->cleanup_failed)
+    // With drain_wait, their completion wakes the runtime instead of a timer.
+    if (actor->phase == AE_STATE_DRAINING && actor->auto_release && !actor->cleanup_failed &&
+        !actor->backend.drain_wait)
         return 1000;
     return -1;
 }

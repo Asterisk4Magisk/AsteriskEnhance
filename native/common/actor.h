@@ -51,6 +51,9 @@ struct AeActorBackend {
     // Optional single-operation inventory/config validation. No snapshots may
     // be reused across separate ACTIVATE/CHECK requests.
     int (*validate)(void *, const struct AeCacheBinding *, uint32_t count, uint32_t discovered);
+    // Optional: release is waiting for in-flight queries or store readers.
+    // The backend signals the runtime once they finish; there is no timer.
+    void (*drain_wait)(void *);
 };
 // All actor methods run on one background writer. Resolver readers use store.
 #ifdef __cplusplus
