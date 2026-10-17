@@ -7,9 +7,9 @@ and isolates resolver caches between DNS policies.
 
 DNS sockets remain owned by netd. Routing uses marks derived from the requesting
 application UID and reuses the core's existing transparent proxy or SOCKS ingress.
-The module does not add a dedicated DNS listener. `asteriskd` publishes the policy;
-disconnect or lease expiration withdraws it, and a previous active session is
-never restored.
+The module does not add a dedicated DNS listener. `asteriskd` publishes the policy.
+Explicit withdrawal or control-connection loss withdraws it; there is no periodic
+renewal or policy expiration, and a previous active session is never restored.
 
 ## Compatibility
 
@@ -37,7 +37,11 @@ Network discovery omits caches without DNS servers, while cache
 reservation still treats those entries as occupied. A newly configured network
 changes the discovered inventory and requires a new policy generation. INFO
 reports module capabilities; it does not guarantee that the system has published
-DNS configuration. PREPARE fails when no configured DNS network is available.
+DNS configuration. A valid empty network inventory allows PREPARE to succeed;
+activation installs a zero-cache UID guard and enters `waiting-network` until
+a network change triggers preparation of a fresh generation. Selected queries
+cannot fall back to the original shared cache while waiting. Discovery errors
+and invalid or unsafe resolver configurations still fail preparation.
 Resolver preparation failures are logged under the `AsteriskEnhance` logcat tag and returned to the supervisor with stage, reason, underlying error and network ID. Startup reports retain the cause even after logcat rotates. Only known transient preparation failures with complete cleanup receive bounded startup retries.
 
 ## Missed netd injection recovery
