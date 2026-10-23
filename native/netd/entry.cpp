@@ -4,6 +4,7 @@
 #include <android/log.h>
 #include <android/dlext.h>
 #include <atomic>
+#include <climits>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -100,20 +101,17 @@ void decorate_context(AeContext *context) {
     if (!context || !ae_query_in_command())
         return;
     if (ae_store_has_active(ae_store_global())) {
-        bool unavailable = false;
-        // API27's experimental TLS validation has no completion callback.
-        // Check its local resolver state only on a real query, never on a timer.
-        if (platform_api == 27) {
-            AeDnsConfig config{};
-            if (ae_backend_read(context->dns_netid, &config)) {
-                ae_runtime_network_changed();
-                unavailable = true;
-            }
-        }
+        const uint32_t original_network = context->dns_netid;
         const auto decision = ae_store_apply_observed(
             ae_store_global(), netd_instance, context, ae_query_observe, nullptr);
-        if (unavailable && decision == AE_PROXY)
+        // API27's experimental TLS validation has no completion callback.
+        // Check its local resolver state only for a real selected query, never
+        // on a timer; unselected queries keep their original network untouched.
+        if (platform_api == 27 && decision == AE_PROXY &&
+            ae_backend_tls27_blocked(original_network)) {
+            ae_runtime_network_changed();
             context->dns_netid = 0x7fffffffU;
+        }
     }
 }
 
@@ -424,6 +422,30 @@ void loaded(void *self, const ZygiskNextAPI *api) {
         pthread_detach(thread);
 }
 
+// The bridge ships next to this library. Derive its path from the loaded image
+// when that image is a regular module file; otherwise use the module location.
+int open_resolver_bridge() {
+    constexpr char kSelf[] = "/libasterisk_enhance.so";
+    constexpr char kBridge[] = "libae_resolver29.so";
+    Dl_info info{};
+    char path[PATH_MAX];
+    if (dladdr(reinterpret_cast<void *>(&open_resolver_bridge), &info) && info.dli_fname &&
+        info.dli_fname[0] == '/') {
+        const size_t length = std::strlen(info.dli_fname);
+        const size_t self = sizeof(kSelf) - 1;
+        if (length > self && !std::strcmp(info.dli_fname + length - self, kSelf) &&
+            length - self + 1 + sizeof(kBridge) <= sizeof(path)) {
+            std::memcpy(path, info.dli_fname, length - self + 1);
+            std::memcpy(path + length - self + 1, kBridge, sizeof(kBridge));
+            const int fd = open(path, O_RDONLY | O_CLOEXEC);
+            if (fd >= 0)
+                return fd;
+        }
+    }
+    return open("/data/adb/modules/zygisk-next-asterisk-enhance/lib/libae_resolver29.so",
+                O_RDONLY | O_CLOEXEC);
+}
+
 void companion_loaded() {
     __android_log_print(ANDROID_LOG_INFO, kTag, "companion loaded");
 }
@@ -437,9 +459,7 @@ void companion_connected(int fd) {
         nonce ^= 0x5a5a5a5a5a5a5a5aULL;
         connected = transfer(fd, &nonce, sizeof(nonce), true);
         if (connected && api >= 29) {
-            const int library =
-                open("/data/adb/modules/zygisk-next-asterisk-enhance/lib/libae_resolver29.so",
-                     O_RDONLY | O_CLOEXEC);
+            const int library = open_resolver_bridge();
             if (library >= 0) {
                 uint64_t tag = 0x41454c4942524152ULL;
                 iovec payload{&tag, sizeof(tag)};

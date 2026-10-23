@@ -9,6 +9,7 @@
 #include <climits>
 #include <cstring>
 #include <dlfcn.h>
+#include <pthread.h>
 
 namespace {
 using aidl::android::net::BpDnsResolver;
@@ -19,13 +20,28 @@ int status_error(const ndk::ScopedAStatus &status) {
     const int service = status.getServiceSpecificError();
     return service > 0 ? -service : service < 0 ? service : -EIO;
 }
-ndk::SpAIBinder service() {
+std::shared_ptr<BpDnsResolver> resolver() {
     // Service-manager entrypoints are platform APIs, not in the application
     // NDK stub library. Resolve the documented C signature in privileged netd.
     using CheckService = AIBinder *(*)(const char *);
     static const auto check =
         reinterpret_cast<CheckService>(dlsym(RTLD_DEFAULT, "AServiceManager_checkService"));
-    return ndk::SpAIBinder(check ? check("dnsresolver") : nullptr);
+    // dnsresolver is served by netd itself, the process this bridge lives in,
+    // so a registered binder never outlives or predates its service. Cache it
+    // after the first successful lookup; an absent service is looked up again.
+    static pthread_mutex_t gate = PTHREAD_MUTEX_INITIALIZER;
+    static std::shared_ptr<BpDnsResolver> cached;
+    pthread_mutex_lock(&gate);
+    if (!cached && check) {
+        ndk::SpAIBinder binder(check("dnsresolver"));
+        // Always use the generated proxy. Do not cast a local platform C++ service
+        // object into our NDK C++ types; all parameters cross the stable Binder API.
+        if (binder.get())
+            cached = ndk::SharedRefBase::make<BpDnsResolver>(binder);
+    }
+    auto proxy = cached;
+    pthread_mutex_unlock(&gate);
+    return proxy;
 }
 bool valid_id(uint32_t id) {
     return id > 0 && id <= INT32_MAX;
@@ -37,12 +53,9 @@ extern "C" __attribute__((visibility("default"))) int ae_resolver_read_config_de
     *reason = AE_REASON_BACKEND;
     if (!output || !valid_id(id))
         return -EINVAL;
-    auto binder = service();
-    if (!binder.get())
+    auto proxy = resolver();
+    if (!proxy)
         return -ENOTCONN;
-    // Always use the generated proxy. Do not cast a local platform C++ service
-    // object into our NDK C++ types; all parameters cross the stable Binder API.
-    auto proxy = ndk::SharedRefBase::make<BpDnsResolver>(binder);
     std::vector<std::string> servers, domains, tls;
     // AIDL out arrays carry the caller's requested size. Android 10 writes
     // timeout_count[0] without resizing it; an empty array crashes its service.
@@ -94,10 +107,9 @@ extern "C" __attribute__((visibility("default"))) int ae_resolver_read_config_de
 extern "C" __attribute__((visibility("default"))) int ae_resolver_reserve(uint32_t id) {
     if (!valid_id(id))
         return -EINVAL;
-    auto binder = service();
-    if (!binder.get())
+    auto proxy = resolver();
+    if (!proxy)
         return -ENOTCONN;
-    auto proxy = ndk::SharedRefBase::make<BpDnsResolver>(binder);
     return status_error(proxy->createNetworkCache(static_cast<int32_t>(id)));
 }
 
@@ -126,19 +138,17 @@ ae_resolver_configure(uint32_t id, const AeDnsConfig *config) {
             return -EINVAL;
         params.domains.emplace_back(config->domains[i], length);
     }
-    auto binder = service();
-    if (!binder.get())
+    auto proxy = resolver();
+    if (!proxy)
         return -ENOTCONN;
-    auto proxy = ndk::SharedRefBase::make<BpDnsResolver>(binder);
     return status_error(proxy->setResolverConfiguration(params));
 }
 
 extern "C" __attribute__((visibility("default"))) int ae_resolver_destroy(uint32_t id) {
     if (!valid_id(id))
         return -EINVAL;
-    auto binder = service();
-    if (!binder.get())
+    auto proxy = resolver();
+    if (!proxy)
         return -ENOTCONN;
-    auto proxy = ndk::SharedRefBase::make<BpDnsResolver>(binder);
     return status_error(proxy->destroyNetworkCache(static_cast<int32_t>(id)));
 }

@@ -77,13 +77,31 @@ Record *find(uint32_t id) {
             return &record;
     return nullptr;
 }
+// API26-28 real networks that may own a resolver cache. The configure/delete
+// hooks update it while serialized with the original call, and it is seeded
+// once after they are installed, so discovery never probes the full netId range.
+// Recursive: an OEM resolver that nests configure/delete cannot self-deadlock.
+pthread_mutex_t inventory = PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP;
+uint32_t known_networks[0x10000U / 32U];
+void set_known(uint32_t id, bool present) {
+    if (!id || id > 0xffffU)
+        return;
+    const uint32_t bit = 1U << (id % 32U);
+    if (present)
+        known_networks[id / 32U] |= bit;
+    else
+        known_networks[id / 32U] &= ~bit;
+}
 int configure_guard26(unsigned id,
                       const char **servers,
                       unsigned count,
                       const char *domains,
                       const Params26 *params) {
     if (!candidate(id)) {
+        pthread_mutex_lock(&inventory);
         const int result = original_configure26(id, servers, count, domains, params);
+        set_known(id, true); // A failed update may still leave an older cache.
+        pthread_mutex_unlock(&inventory);
         ae_runtime_network_changed();
         return result;
     }
@@ -94,7 +112,10 @@ int configure_guard26(unsigned id,
 }
 void delete_guard26(unsigned id) {
     if (!candidate(id)) {
+        pthread_mutex_lock(&inventory);
         original_delete26(id);
+        set_known(id, false);
+        pthread_mutex_unlock(&inventory);
         ae_runtime_network_changed();
         return;
     }
@@ -153,7 +174,7 @@ int legacy_info(uint32_t id, AeDnsConfig *output) {
     sockaddr_storage servers[4]{};
     char domains[6][256]{};
     Params26 params{};
-    Stats26 stats[4]{};
+    Stats26 stats[4]; // Output only and never read; skip clearing 4 KiB per call.
     const int revision = stats26(id, &count, servers, &domain_count, domains, &params, stats);
     if (revision < 0)
         return -ENOENT;
@@ -203,6 +224,19 @@ int legacy_info(uint32_t id, AeDnsConfig *output) {
     config.parameters[3] = params.max_samples;
     *output = config;
     return 0;
+}
+// Lightweight per-query API27 state check: server presence and TLS use only.
+// Configuration changes still arrive through the configure/delete hooks.
+bool legacy_tls27_blocked(uint32_t id) {
+    int count = 0, domain_count = 0;
+    sockaddr_storage servers[4]{};
+    char domains[6][256];
+    Params26 params{};
+    Stats26 stats[4];
+    if (stats26(id, &count, servers, &domain_count, domains, &params, stats) < 0 || count < 1 ||
+        count > 4)
+        return true;
+    return ae_platform_private_dns27(private_dns27, id, servers, static_cast<uint32_t>(count)) != 0;
 }
 int legacy_configure(uint32_t id, const AeDnsConfig &config) {
     const char *servers[4]{};
@@ -399,6 +433,10 @@ int routes(void *, uint32_t network, uint32_t id, AeDnsRoute *output, uint32_t c
                        mark_error,
                        network);
     }
+    // Every rejected server keeps a precise failure for the supervisor report.
+    const auto invalid_route = [network] {
+        return failure(AE_FAIL_ROUTES, AE_REASON_INVALID_CONFIG, -EINVAL, network);
+    };
     for (uint32_t i = 0; i < record->config.server_count; ++i) {
         AeDnsRoute route{};
         route.network_id = network;
@@ -406,12 +444,12 @@ int routes(void *, uint32_t network, uint32_t id, AeDnsRoute *output, uint32_t c
         char server[sizeof(record->config.servers[i])];
         std::memcpy(server, record->config.servers[i], sizeof(server));
         if (!std::memchr(server, 0, sizeof(server)))
-            return -EINVAL;
+            return invalid_route();
         char *scope = std::strchr(server, '%');
         if (scope) {
             *scope++ = 0;
             if (!*scope)
-                return -EINVAL;
+                return invalid_route();
             char *end = nullptr;
             errno = 0;
             const unsigned long value = std::strtoul(scope, &end, 10);
@@ -420,16 +458,16 @@ int routes(void *, uint32_t network, uint32_t id, AeDnsRoute *output, uint32_t c
             else
                 route.scope_id = if_nametoindex(scope);
             if (!route.scope_id)
-                return -EINVAL;
+                return invalid_route();
         }
         if (inet_pton(AF_INET, server, route.address) == 1) {
             if (scope)
-                return -EINVAL;
+                return invalid_route();
             route.family = 4;
         } else if (inet_pton(AF_INET6, server, route.address) == 1)
             route.family = 6;
         else
-            return -EINVAL;
+            return invalid_route();
         output[i] = route;
     }
     return static_cast<int>(record->config.server_count);
@@ -486,6 +524,15 @@ bool ae_backend_init(const ZygiskNextAPI *api, int sdk, void *bridge, const char
                             reinterpret_cast<void **>(&original_delete26)) != ZN_SUCCESS) {
             api->inlineUnhook(configure);
             return false;
+        }
+        // Seed once, after the hooks track later changes. Each probe holds the
+        // inventory lock, so a concurrent configure/delete of that ID is ordered
+        // with it and the bitmap matches the resolver's final cache set.
+        for (uint32_t id = 1; id <= 0xffffU; ++id) {
+            pthread_mutex_lock(&inventory);
+            if (!legacy_info(id, nullptr))
+                set_known(id, true);
+            pthread_mutex_unlock(&inventory);
         }
     } else if (sdk >= 29 && bridge) {
         if (!api || !resolver_path)
@@ -591,6 +638,9 @@ int ae_backend_read(uint32_t network, AeDnsConfig *output) {
     if (error == -ENOENT) reason = AE_REASON_NOT_READY;
     return failure(AE_FAIL_READ, reason, error, network);
 }
+bool ae_backend_tls27_blocked(uint32_t network) {
+    return !ready || platform != 27 || legacy_tls27_blocked(network);
+}
 int ae_backend_networks(uint32_t *output, uint32_t capacity) {
     return discover(output, capacity, nullptr, 0);
 }
@@ -627,10 +677,17 @@ static int discover(uint32_t *output, uint32_t capacity,
         }
         return static_cast<int>(count);
     }
-    // The legacy public stats API is a native, mutex-protected lookup. Enumerate
-    // the bounded real-network domain without reading private cache structures.
+    // The legacy public stats API is a native, mutex-protected lookup. Read only
+    // networks the hooks have seen, without reading private cache structures.
+    // Changes after this snapshot signal a resolver event and a fresh check.
+    uint32_t known[sizeof(known_networks) / sizeof(known_networks[0])];
+    pthread_mutex_lock(&inventory);
+    std::memcpy(known, known_networks, sizeof(known));
+    pthread_mutex_unlock(&inventory);
     uint32_t count = 0;
     for (uint32_t id = 1; id <= 0xffffU; ++id) {
+        if (!(known[id / 32U] & (1U << (id % 32U))))
+            continue;
         AeDnsConfig config{};
         const int error = legacy_info(id, &config);
         if (error == -ENOENT)

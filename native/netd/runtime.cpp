@@ -32,6 +32,23 @@ bool ae_runtime_init(uint64_t instance, uint32_t api, uint32_t modes, uint32_t f
     AeRuntimeGuard guard;
     if (session)
         return true;
+    // Build the immutable INFO snapshot first: a failure must leave no partial
+    // runtime behind that a later call would mistake for an initialized one.
+    char text[512];
+    const int length = std::snprintf(text,
+                                     sizeof(text),
+                                     "AE_INFO "
+                                     "1\nversionCode=%s\nversion=%s\nbuildId=%s\nnetd=%llu\napi=%"
+                                     "u\nmodes=%u\nflags=%u\nprotocol=7\n",
+                                     AE_MODULE_VERSION_CODE,
+                                     AE_MODULE_VERSION,
+                                     AE_MODULE_BUILD_ID,
+                                     static_cast<unsigned long long>(instance),
+                                     api,
+                                     modes,
+                                     flags);
+    if (length <= 0 || static_cast<size_t>(length) >= sizeof(text))
+        return false;
     const int event = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (event < 0)
         return false;
@@ -54,21 +71,6 @@ bool ae_runtime_init(uint64_t instance, uint32_t api, uint32_t modes, uint32_t f
         session = nullptr;
         return false;
     }
-    char text[512];
-    const int length = std::snprintf(text,
-                                     sizeof(text),
-                                     "AE_INFO "
-                                     "1\nversionCode=%s\nversion=%s\nbuildId=%s\nnetd=%llu\napi=%"
-                                     "u\nmodes=%u\nflags=%u\nprotocol=7\n",
-                                     AE_MODULE_VERSION_CODE,
-                                     AE_MODULE_VERSION,
-                                     AE_MODULE_BUILD_ID,
-                                     static_cast<unsigned long long>(instance),
-                                     api,
-                                     modes,
-                                     flags);
-    if (length <= 0 || static_cast<size_t>(length) >= sizeof(text))
-        return false;
     runtime_info.assign(text, text + length);
     network_event.store(event);
     drain_event.store(drained);

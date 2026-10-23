@@ -5,86 +5,157 @@ and AsteriskMETA. It hooks only `/system/bin/netd`, uses the original full
 Android UID of system DNS requests to steer TCP/UDP 53 by application policy,
 and isolates resolver caches between DNS policies.
 
-DNS sockets remain owned by netd. Routing uses marks derived from the requesting
-application UID and reuses the core's existing transparent proxy or SOCKS ingress.
-The module does not add a dedicated DNS listener. `asteriskd` publishes the policy.
-Explicit withdrawal or control-connection loss withdraws it; there is no periodic
-renewal or policy expiration, and a previous active session is never restored.
+- DNS sockets remain owned by netd. Routing uses marks derived from the
+  requesting application UID and reuses the core's existing transparent proxy
+  or SOCKS ingress. The module adds no dedicated DNS listener.
+- `asteriskd` publishes the policy. Explicit withdrawal or loss of the control
+  connection withdraws it. There is no periodic renewal or policy expiration,
+  and a previous active session is never restored.
 
-## Compatibility
+## Requirements
 
-- Android 8 / API 26 or newer, with Zygisk Next installed and enabled.
-- TPROXY and TUN2SOCKS integration starts at API 26; BPF2SOCKS starts at API 33.
-- TUN and the core's eBPF mode remain managed by the core.
-- arm64-v8a, armeabi-v7a, x86_64, and x86 use the same runtime capability checks.
-- Activation requires the expected netd/resolver symbols, successful hooks,
-  a usable resolver backend, and query lifetime tracking. There is no device
-  build ID allowlist or restriction based on which architectures were tested.
-- Compatible API 33+ systems can advertise all three modes. Earlier systems
-  advertise TPROXY/TUN2SOCKS. The supervisor and helper determine BPF
-  attachment compatibility at runtime; enhancement does not exclude newer APIs
-  solely by their Android version.
+| Item | Requirement |
+| --- | --- |
+| Android | 8.0 / API 26 or newer |
+| Framework | Zygisk Next installed and enabled |
+| ABIs | arm64-v8a, armeabi-v7a, x86_64, x86 (same runtime checks for all) |
+| Modes | TPROXY and TUN2SOCKS from API 26; BPF2SOCKS from API 33 |
+| SELinux | Enforcing; see [SELinux policy](#selinux-policy) |
+
+TUN and the core's eBPF mode remain managed by the core.
+
+Activation requires the expected netd/resolver symbols, successful hooks, a
+usable resolver backend, and query lifetime tracking. There is no device build
+ID allowlist and no restriction based on which architectures were tested.
+Compatible API 33+ systems advertise all three modes; earlier systems advertise
+TPROXY and TUN2SOCKS. The supervisor and helper decide BPF attachment
+compatibility at runtime; newer APIs are never excluded by version alone.
 
 Runtime verification includes x86_64 AVDs and an ARM64 Android 16 device with
 SELinux enforcing. Other ABI builds remain available without an artificial
 runtime block; device compatibility feedback is welcome.
 
-Activation requires a valid prepared resolver configuration. Caches belong to individual networks
-and policy generations. Active Private DNS, DNS64/NAT64, or unknown resolver
-configuration prevents activation when a safe clone cannot be made.
+## DNS behavior
 
-Network discovery omits caches without DNS servers, while cache
-reservation still treats those entries as occupied. A newly configured network
-changes the discovered inventory and requires a new policy generation. INFO
-reports module capabilities; it does not guarantee that the system has published
-DNS configuration. A valid empty network inventory allows PREPARE to succeed;
-activation installs a zero-cache UID guard and enters `waiting-network` until
-a network change triggers preparation of a fresh generation. Selected queries
-cannot fall back to the original shared cache while waiting. Discovery errors
-and invalid or unsafe resolver configurations still fail preparation.
-Resolver preparation failures are logged under the `AsteriskEnhance` logcat tag and returned to the supervisor with stage, reason, underlying error and network ID. Startup reports retain the cause even after logcat rotates. Only known transient preparation failures with complete cleanup receive bounded startup retries.
+- Caches belong to individual networks and policy generations. Activation
+  requires a valid prepared resolver configuration.
+- Active Private DNS, DNS64/NAT64, or an unknown resolver configuration prevents
+  activation when a safe clone cannot be made.
+- Networks without DNS servers are omitted from discovery but still count as
+  occupied cache IDs. A newly configured network changes the inventory and
+  requires a new policy generation.
+- With no usable network (offline), preparation still succeeds. Activation
+  installs a zero-cache UID guard and reports `waiting-network` until a network
+  change prepares a fresh generation. Selected queries never fall back to the
+  original shared cache while waiting.
+- Discovery errors and invalid or unsafe resolver configurations fail
+  preparation. INFO reports module capabilities only; it does not guarantee
+  that the system has published a DNS configuration.
+
+## Troubleshooting
+
+All runtime messages use the `AsteriskEnhance` logcat tag.
+
+| Symptom | Where to look |
+| --- | --- |
+| Enhancement never becomes active | `loaded; API …; context hook=…` after boot. `context hook=0` means a missing interface or hook failure. |
+| `hook executable memory unavailable` | The module SELinux rule was not loaded; check that the ROOT manager applied `sepolicy.rule`. |
+| Preparation fails | `DNS prepare failure: stage=… reason=… error=… network=…`. The supervisor receives the same stage, reason, error and network ID, and keeps them after logcat rotates. |
+| Module missing after boot | `netd_recovery stage=…` lines; see [Missed netd injection recovery](#missed-netd-injection-recovery). |
+
+Only known transient preparation failures with complete cleanup receive bounded
+startup retries. Stage and reason codes are listed in the
+[control protocol](docs/control-protocol.md#failure-details).
+
+## Installation
+
+The module ID is `zygisk-next-asterisk-enhance`; ROOT managers display
+`Asterisk Enhance`. The installer extracts only module files and does not
+bundle Zygisk Next.
+
+Applications pass their own installed APK directly to the Magisk, KernelSU, or
+APatch CLI and display the live installation output. If a ROOT manager does not
+accept APK files, export the application APK, rename its extension to `.zip`,
+and install it manually. Installation and updates require a device reboot; the
+applications never reboot automatically.
+
+Applications offer an update only when the running `versionCode` is lower than
+the version bundled in their APK. `version` and `buildId` are diagnostic fields.
+Increment `versionCode` in `module/module.prop` for releases that require an
+update. Update decisions never inspect module directories on disk.
 
 ## Missed netd injection recovery
 
-The installer selects `post-mount.sh` for KernelSU and APatch, after their
-module `post-fs-data.sh` scripts have finished. Magisk uses `post-fs-data.sh`;
+The installer selects `post-mount.sh` for KernelSU and APatch, which runs after
+their module `post-fs-data.sh` scripts finish. Magisk uses `post-fs-data.sh`;
 its module order does not guarantee that Zygisk Next has already initialized.
 Both use the same synchronous recovery script. An upgrade removes the old
 `service.sh` and installs only the selected entry point.
 
 Recovery runs only before Zygote has ever started and before boot completion.
-It requires an enabled Zygisk Next module, a responding daemon, readable and
-unchanged process identities, and netd starting before that daemon. If the
-module loaded marker and library are both absent, it stops netd, waits up to
-five seconds for init to confirm it stopped, then starts it again. Separate
-stop/start avoids netd's `onrestart` actions. A stop timeout never sends start
-while the old process may still be stopping. Control failures and outcomes are
-logged under `AsteriskEnhance` with `netd_recovery` and the selected boot stage.
+It requires:
 
-A process-lifetime abstract socket marks module loading before hook installation.
-Hook, capability, and DNS preparation failures therefore do not trigger this
+- an enabled Zygisk Next module with a responding daemon;
+- readable and unchanged process identities;
+- netd started before that daemon;
+- neither the module loaded marker nor the library present in netd.
+
+It then stops netd, waits up to five seconds for init to confirm the stop, and
+starts it again. Separate stop/start avoids netd's `onrestart` actions, and a
+stop timeout never sends start while the old process may still be stopping.
+Control failures and outcomes are logged with `netd_recovery` and the boot stage.
+
+A process-lifetime abstract socket marks module loading before hook
+installation, so hook, capability, and DNS preparation failures never trigger
 recovery. The DNS companion initializes after boot completion and is not checked
-in this early stage. Missing/disabled or unready Zygisk Next, unknown process
-state, a changed process, a module already loaded, or a framework that has
-started skips recovery. A `/dev` lock limits the check to once per boot. There
-is no background worker, late-boot fallback, or retry; recovery runs independently
-of the applications and their VPN lifecycle.
+in this early stage. Recovery is skipped when Zygisk Next is missing, disabled
+or unready, when the process state is unknown or changed, when the module is
+already loaded, or when the framework has started. A `/dev` lock limits the
+check to once per boot. There is no background worker, late-boot fallback, or
+retry; recovery is independent of the applications and their VPN lifecycle.
 
 ## SELinux policy
 
-The module installs `sepolicy.rule` in standalone packages and application APKs.
-It grants `netd` only the additional `self:process execmem` permission required
-by Zygisk Next inline hooks. SELinux remains enforcing. Before installing hooks,
-the module checks executable memory access and leaves enhancement unavailable
-if this prerequisite fails, rather than risking a netd crash.
+The module installs `sepolicy.rule` in standalone packages and application
+APKs. It grants `netd` only the additional `self:process execmem` permission
+required by Zygisk Next inline hooks. Before installing hooks the module checks
+executable memory access and leaves enhancement unavailable if this check
+fails, rather than risking a netd crash.
 
 The companion runs in the ROOT manager's domain. Zygisk Next supplies its
-private transport; the companion passes the resolver bridge as a file descriptor
-with the `system_lib_file` label. Resolver Binder access uses netd's existing
-platform permissions. No application-domain access, permissive domain, or
-wildcard SELinux grant is added by this module.
+private transport, and the companion passes the resolver bridge to netd as a
+file descriptor with the `system_lib_file` label. Resolver Binder access uses
+netd's existing platform permissions. The module adds no application-domain
+access, permissive domain, or wildcard SELinux grant.
 
-## Standalone build
+## Runtime cost
+
+- No periodic timers or polling. Idle broker and netd workers wait for socket,
+  property, or eventfd events; resolver hooks only signal an eventfd.
+- Policy decisions on the DNS path do no allocation, file access, IPC, or
+  full-list scan (binary search over sorted UID lists).
+- API 26–28 discovery reads only networks that the resolver configure/delete
+  hooks have seen. The full netId range is probed once, when the backend starts.
+- API 27 checks its TLS validation state only for queries that the policy
+  selects, because that platform has no completion callback.
+
+## Control interface
+
+`@asterisk.enhance.dns` provides control requests and a read-only INFO query.
+Control requests require the root process that owns the current
+`@asteriskd.control` listener. INFO never establishes a control session or
+changes DNS policy or caches, and it is answered even while a control request
+is in progress.
+
+Policies last until explicit withdrawal or control-connection loss. Resolver
+changes trigger configuration checks and fresh cache generations when needed.
+A stalled supervisor with an open connection retains its last policy.
+Capability revision 7 requires matching application support.
+
+See [control-protocol.md](docs/control-protocol.md) for framing, cache
+ownership, and lifecycle requirements.
+
+## Building
 
 Python 3.10 or newer, Android SDK Build Tools 37.0.0, and an Android NDK are
 required. The build entry point selects the Windows, Linux, or macOS toolchain
@@ -95,51 +166,21 @@ and inherits the caller's environment.
 python tools/build.py --sdk "<SDK_DIR>" --ndk "<NDK_DIR>"
 ```
 
-The default build includes arm64-v8a, armeabi-v7a, x86_64, and x86, and writes
-`dist/asterisk-enhance.zip`. Use `--abi x86_64` for one ABI or `--abis` for an
-explicit list. `--work-directory` selects the intermediate directory, and
-`--output-directory` exports each ABI's native libraries and runtime identity.
-Application builds use `--skip-package` to build and export payloads without
-creating a separate module ZIP.
+- The default build includes all four ABIs and writes
+  `dist/asterisk-enhance.zip`. Use `--abi x86_64` for one ABI or `--abis` for
+  an explicit list.
+- `--work-directory` selects the intermediate directory; `--output-directory`
+  exports each ABI's native libraries and runtime identity.
+- Application builds use `--skip-package` to build and export payloads without
+  creating a separate module ZIP.
 
-## Application integration and installation
+### Application integration
 
-The Git submodule checkout path is `enhance/src/main/module`. Local
-application builds can use `-PenhanceSourceDir=<path>`. Each application's
-`enhance` Gradle module adds installer files and all four ABI payloads before
-APK signing. Payloads live under `assets/enhance/lib/<ABI>/` and are independent
-of the APK's JNI ABI split.
-
-The module ID is `zygisk-next-asterisk-enhance`; ROOT managers display
-`Asterisk Enhance`. The installer extracts only module files and does not bundle
-Zygisk Next.
-
-Applications pass their own installed APK directly to the Magisk, KernelSU, or
-APatch CLI and display live installation output. If a ROOT manager does not
-accept APK files, export the application APK, rename its extension to `.zip`,
-and install it manually. Installation and updates require a device reboot;
-the applications never reboot automatically.
-
-## Control interface
-
-`@asterisk.enhance.dns` provides control requests and a read-only INFO query.
-Control requests require the root process owning the current
-`@asteriskd.control` listener. INFO does not establish a control session or
-change DNS policy or caches.
-
-Applications offer an update only when the running `versionCode` is lower than
-the version bundled in their APK. `version` and `buildId` are diagnostic fields.
-Increment `versionCode` in `module/module.prop` for releases requiring an update.
-Detection and update decisions do not inspect module directories on disk.
-
-See [control-protocol.md](docs/control-protocol.md) for framing, cache ownership,
-and lifecycle requirements.
-
-Idle control workers wait for events. Policies last until explicit withdrawal or
-control-connection loss, with no heartbeat or periodic renewal. Resolver changes
-trigger configuration checks and fresh cache generations when needed. A stalled
-supervisor with an open connection retains its last policy. Capability revision 7
-requires matching application support.
+The Git submodule checkout path is `enhance/src/main/module`. Local application
+builds can use `-PenhanceSourceDir=<path>`. Each application's `enhance` Gradle
+module adds the installer files and all four ABI payloads before APK signing.
+Payloads live under `assets/enhance/lib/<ABI>/` and are independent of the
+APK's JNI ABI split.
 
 ## License
 

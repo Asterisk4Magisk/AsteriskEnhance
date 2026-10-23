@@ -3,6 +3,7 @@
 
 #include "actor.h"
 #include "store.h"
+#include <errno.h>
 
 struct AeActor {
     void *store;
@@ -161,6 +162,13 @@ enum AeResult ae_actor_prepare(void *memory,
         return AE_UNSUPPORTED;
     if (actor->phase != AE_STATE_IDLE)
         return AE_BUSY;
+    // Reject stale identities before any resolver inventory work.
+    if ((actor->connection == connection && actor->key.instance &&
+         actor->key.instance != key->instance) ||
+        (actor->key.instance == key->instance &&
+         (key->cycle < actor->key.cycle ||
+          (key->cycle == actor->key.cycle && key->generation <= actor->key.generation))))
+        return AE_STALE;
     const uint32_t discovered = !input->network_count;
     uint32_t networks[AE_MAX_NETWORKS];
     struct AePrepare resolved = *input;
@@ -169,8 +177,7 @@ enum AeResult ae_actor_prepare(void *memory,
             return AE_UNSUPPORTED;
         const int count = actor->backend.networks(actor->backend.opaque, networks, AE_MAX_NETWORKS);
         if (count < 0 || count > (int)AE_MAX_NETWORKS) {
-            failed(actor, AE_FAIL_DISCOVER, count == 0 ? AE_REASON_NOT_READY : AE_REASON_BACKEND,
-                   count < 0 ? count : 0, 0);
+            failed(actor, AE_FAIL_DISCOVER, AE_REASON_BACKEND, count < 0 ? count : -EOVERFLOW, 0);
             return AE_CACHE_ERROR;
         }
         resolved.network_count = (uint32_t)count;
@@ -181,12 +188,6 @@ enum AeResult ae_actor_prepare(void *memory,
         }
         input = &resolved;
     }
-    if ((actor->connection == connection && actor->key.instance &&
-         actor->key.instance != key->instance) ||
-        (actor->key.instance == key->instance &&
-         (key->cycle < actor->key.cycle ||
-          (key->cycle == actor->key.cycle && key->generation <= actor->key.generation))))
-        return AE_STALE;
     actor->connection = connection;
     actor->key = *key;
     actor->auto_release = 0;
@@ -213,10 +214,10 @@ enum AeResult ae_actor_prepare(void *memory,
     for (uint32_t i = 0; i < input->network_count && error == AE_OK; ++i) {
         int created = 0;
         for (unsigned attempt = 0; attempt < 32 && !created; ++attempt) {
-            if (actor->used_ids >= 0x10000U) {
-                error = AE_EXHAUSTED;
-                break;
-            }
+            // Cycle the private range for the whole netd lifetime. PREPARE starts
+            // IDLE with nothing owned, and release deletes a cache only after its
+            // queries are quiescent, so a reused ID is never still referenced.
+            // IDs still held elsewhere are reported as collisions and skipped.
             const uint32_t id = 0x40000000U + ((actor->seed + actor->used_ids++) & 0xffffU);
             uint32_t owned = 0;
             const int result =

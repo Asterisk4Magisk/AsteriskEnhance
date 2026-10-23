@@ -18,4 +18,7 @@ bool ae_backend_ready();
 int ae_original_dns_mark(uint32_t network, uint32_t *mark);
 AeActorBackend ae_backend_callbacks();
 int ae_backend_read(uint32_t network, AeDnsConfig *);
+// API27 only, from resolver threads: true when selected queries on this
+// original network must not use its isolated cache. No logging or failure state.
+bool ae_backend_tls27_blocked(uint32_t network);
 int ae_backend_networks(uint32_t *output, uint32_t capacity);
